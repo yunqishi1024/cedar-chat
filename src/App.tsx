@@ -1,0 +1,4106 @@
+// 主界面：provider/model 选择 + 能力感知的控件 + 消息列表 + 输入框
+//
+// 设计要点：
+// 1. "全自定义 provider"：所有 provider 来自 localStorage，没有硬编码
+// 2. UI 查询 capability 表决定显示哪些控件（temperature 滑块 vs reasoning effort）
+// 3. 流式消息：assistant 消息边收边渲染，thinking 和 text 分开显示
+
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type DragEvent,
+} from "react";
+import { Settings, type SettingsTab } from "./components/Settings";
+import {
+  createProvider,
+  getCapability,
+  type ChatAttachment,
+  type ChatContentPart,
+  type ChatMessage,
+  type ChatTextContentPart,
+  type ChatTool,
+  type ChatToolCall,
+  type ContentBlock,
+  type ModelCapability,
+  type ProviderConfig,
+  type ToolBlock,
+  type VoiceBlock,
+} from "./providers";
+import {
+  attachmentFromFile,
+  contentBlocksToPlainText,
+  contentBlocksToPromptParts,
+  formatBytes,
+  hasUserContent,
+} from "./lib/attachments";
+import { playTts, stopBrowserTts, synthesizeSpeech } from "./lib/tts";
+import {
+  loadProviders,
+  saveProviders,
+  loadCurrent,
+  saveCurrent,
+  loadPreferences,
+  savePreferences,
+  loadTtsSettings,
+  saveTtsSettings,
+  getActiveTtsProfile,
+  loadMcpServers,
+  saveMcpServers,
+  loadAgents,
+  saveAgents,
+  loadActiveAgentId,
+  saveActiveAgentId,
+  loadConversations,
+  saveConversations,
+  loadActiveConversationId,
+  saveActiveConversationId,
+  newAgentId,
+  newConversationId,
+  type Agent,
+  type ClaudePromptCacheMode,
+  type ClaudePromptCacheTTL,
+  type Conversation,
+  type ThinkingEffort,
+  type ThinkingMode,
+  type McpServerConfig,
+  type StoredMessage,
+  type Preferences,
+  type TtsSettings,
+} from "./lib/storage";
+import {
+  callMcpTool,
+  listMcpServerTools,
+  type McpToolSummary,
+} from "./lib/mcp";
+
+// ------------------------- Message type (UI-level) -------------------------
+
+interface UIMessage extends StoredMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: ContentBlock[];
+  streaming?: boolean;
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens?: number;
+    cacheWriteInputTokens?: number;
+  };
+}
+
+interface ChatExportPayload {
+  app: "cedar-chat";
+  version: 1;
+  exportedAt: string;
+  agents: Agent[];
+  conversations: Conversation[];
+}
+
+interface ActiveMcpTool {
+  functionName: string;
+  server: McpServerConfig;
+  sessionId?: string;
+  toolName: string;
+  displayName: string;
+  chatTool: ChatTool;
+}
+
+const DEFAULT_TEMPERATURE = 0.7;
+const DEFAULT_REASONING_ENABLED = true;
+const DEFAULT_THINKING_MODE: ThinkingMode = "effort";
+const DEFAULT_THINKING_EFFORT: ThinkingEffort = "medium";
+const DEFAULT_THINKING_BUDGET_TOKENS = 8192;
+const DEFAULT_LEGACY_CLAUDE_PROMPT_CACHE: ClaudePromptCacheMode = "off";
+const DEFAULT_AGENT_PROMPT_CACHE: ClaudePromptCacheTTL = "1h";
+const DEFAULT_CONTEXT_PROMPT_CACHE: ClaudePromptCacheTTL = "5m";
+const DEFAULT_MULTI_MESSAGE_ENABLED = false;
+const DEFAULT_VOICE_MESSAGES_ENABLED = false;
+const DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS = 160;
+const MAX_MCP_TOOL_ROUNDS = 6;
+const MAX_MCP_RESULT_CHARS = 120_000;
+const MAX_TOOL_BLOCK_CHARS = 4_000;
+
+type WindowSettingsPatch = Partial<
+  Pick<
+    Conversation,
+    | "providerId"
+    | "model"
+    | "temperature"
+    | "reasoningEnabled"
+    | "thinkingMode"
+    | "thinkingEffort"
+    | "thinkingBudgetTokens"
+    | "agentPromptCache"
+    | "contextPromptCache"
+    | "showMessageTimestamps"
+    | "injectCurrentTime"
+    | "multiMessageEnabled"
+    | "voiceMessagesEnabled"
+    | "voiceMessageBudgetTokens"
+  >
+>;
+
+function uid() {
+  return "m_" + Math.random().toString(36).slice(2, 10);
+}
+
+function timestampNow() {
+  return Date.now();
+}
+
+function createDefaultAgent(): Agent {
+  const now = Date.now();
+  return {
+    id: newAgentId(),
+    name: "Default agent",
+    profile: "",
+    memory: "",
+    instructions: "",
+    worldBook: "",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function createEmptyConversation(agentId: string | null): Conversation {
+  const now = Date.now();
+  const current = loadCurrent();
+  return {
+    id: newConversationId(),
+    agentId,
+    providerId: current.providerId,
+    model: current.model,
+    temperature: DEFAULT_TEMPERATURE,
+    reasoningEnabled: DEFAULT_REASONING_ENABLED,
+    thinkingMode: DEFAULT_THINKING_MODE,
+    thinkingEffort: DEFAULT_THINKING_EFFORT,
+    thinkingBudgetTokens: DEFAULT_THINKING_BUDGET_TOKENS,
+    agentPromptCache: DEFAULT_AGENT_PROMPT_CACHE,
+    contextPromptCache: DEFAULT_CONTEXT_PROMPT_CACHE,
+    showMessageTimestamps: false,
+    injectCurrentTime: false,
+    multiMessageEnabled: DEFAULT_MULTI_MESSAGE_ENABLED,
+    voiceMessagesEnabled: DEFAULT_VOICE_MESSAGES_ENABLED,
+    voiceMessageBudgetTokens: DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS,
+    title: "New chat",
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function titleFromMessage(text: string): string {
+  const clean = text.trim().replace(/\s+/g, " ");
+  if (!clean) return "New chat";
+  return clean.length > 36 ? `${clean.slice(0, 36)}...` : clean;
+}
+
+function titleFromPromptMessages(messages: StoredMessage[]): string {
+  const firstUser = messages.find((message) => message.role === "user");
+  return firstUser
+    ? titleFromMessage(contentBlocksToPlainText(firstUser.content, true))
+    : "New chat";
+}
+
+function normalizeGeneratedTitle(text: string): string {
+  const clean = text
+    .trim()
+    .split("\n")[0]
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .replace(/^title\s*:\s*/i, "")
+    .replace(/\s+/g, " ");
+  if (!clean) return "New chat";
+  return clean.length > 44 ? `${clean.slice(0, 44)}...` : clean;
+}
+
+function stripTransientContentBlocks(content: ContentBlock[]): ContentBlock[] {
+  return content.map((block) => {
+    if (block.type !== "voice") return block;
+    return block.status === "error"
+      ? {
+          type: "voice",
+          id: block.id,
+          text: block.text,
+          status: "error",
+          error: block.error,
+        }
+      : {
+          type: "voice",
+          id: block.id,
+          text: block.text,
+        };
+  });
+}
+
+function stripTransient(message: UIMessage): StoredMessage {
+  return {
+    id: message.id,
+    role: message.role,
+    content: stripTransientContentBlocks(message.content),
+    createdAt: message.createdAt,
+    usage: message.usage,
+  };
+}
+
+function stripTransientConversation(conversation: Conversation): Conversation {
+  return {
+    ...conversation,
+    messages: conversation.messages.map(stripTransient),
+  };
+}
+
+function collectObjectAudioUrls(conversations: Conversation[]): Set<string> {
+  const urls = new Set<string>();
+  for (const conversation of conversations) {
+    for (const message of conversation.messages) {
+      for (const block of message.content) {
+        if (
+          block.type === "voice" &&
+          block.audioUrl?.startsWith("blob:")
+        ) {
+          urls.add(block.audioUrl);
+        }
+      }
+    }
+  }
+  return urls;
+}
+
+function assistantMessagesFromContentSets(
+  assistantMessage: UIMessage,
+  contentSets: ContentBlock[][],
+  usage: UIMessage["usage"],
+): StoredMessage[] {
+  const sets = contentSets.length > 0 ? contentSets : [[]];
+  const lastIndex = sets.length - 1;
+
+  return sets.map((content, index) => ({
+    id: index === 0 ? assistantMessage.id : uid(),
+    role: "assistant" as const,
+    content,
+    createdAt: assistantMessage.createdAt,
+    usage: index === lastIndex ? usage : undefined,
+  }));
+}
+
+function textFromContent(content: ContentBlock[]): string {
+  return contentBlocksToPlainText(content);
+}
+
+function requestContentFromBlocks(content: ContentBlock[]): string | ChatContentPart[] {
+  const parts = contentBlocksToPromptParts(content);
+  return parts.length === 1 && parts[0].type === "text" ? parts[0].text : parts;
+}
+
+function sanitizeToolName(value: string): string {
+  const cleaned = value
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "mcp_tool";
+}
+
+function uniqueToolName(
+  server: McpServerConfig,
+  tool: McpToolSummary,
+  used: Set<string>,
+): string {
+  const serverPart = sanitizeToolName(server.name || server.id);
+  const toolPart = sanitizeToolName(tool.name);
+  const base = sanitizeToolName(`${serverPart}__${toolPart}`).slice(0, 64);
+  let candidate = base;
+  let counter = 2;
+
+  while (used.has(candidate)) {
+    const suffix = `_${counter}`;
+    candidate = `${base.slice(0, 64 - suffix.length)}${suffix}`;
+    counter += 1;
+  }
+
+  used.add(candidate);
+  return candidate;
+}
+
+function normalizeToolParameters(schema: unknown): Record<string, unknown> {
+  const parameters = isRecord(schema) ? { ...schema } : {};
+  if (typeof parameters.type !== "string") parameters.type = "object";
+  if (!isRecord(parameters.properties)) parameters.properties = {};
+  return parameters;
+}
+
+async function prepareMcpTools(
+  servers: McpServerConfig[],
+): Promise<ActiveMcpTool[]> {
+  const enabledServers = servers.filter(
+    (server) => server.enabled && server.url.trim(),
+  );
+  if (enabledServers.length === 0) return [];
+
+  const usedNames = new Set<string>();
+  const listed = await Promise.all(
+    enabledServers.map(async (server) => ({
+      server,
+      result: await listMcpServerTools(server),
+    })),
+  );
+
+  return listed.flatMap(({ server, result }) =>
+    result.tools.map((tool): ActiveMcpTool => {
+      const functionName = uniqueToolName(server, tool, usedNames);
+      const displayName = `${server.name || server.id}/${tool.name}`;
+      return {
+        functionName,
+        server,
+        sessionId: result.sessionId,
+        toolName: tool.name,
+        displayName,
+        chatTool: {
+          type: "function",
+          function: {
+            name: functionName,
+            description: [
+              `MCP tool ${displayName}.`,
+              tool.description ?? "",
+            ]
+              .filter(Boolean)
+              .join(" "),
+            parameters: normalizeToolParameters(tool.inputSchema),
+          },
+        },
+      };
+    }),
+  );
+}
+
+function parseToolArguments(raw: string): Record<string, unknown> {
+  if (!raw.trim()) return {};
+  const parsed = JSON.parse(raw) as unknown;
+  return isRecord(parsed) ? parsed : { value: parsed };
+}
+
+function formatToolInput(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw) as unknown, null, 2);
+  } catch {
+    return raw || "{}";
+  }
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function limitMcpResult(text: string): string {
+  if (text.length <= MAX_MCP_RESULT_CHARS) return text;
+  return `${text.slice(0, MAX_MCP_RESULT_CHARS)}\n\n[MCP result truncated after ${MAX_MCP_RESULT_CHARS.toLocaleString()} characters.]`;
+}
+
+function limitToolBlockText(text: string): string {
+  if (text.length <= MAX_TOOL_BLOCK_CHARS) return text;
+  return `${text.slice(0, MAX_TOOL_BLOCK_CHARS)}\n\n[Preview truncated.]`;
+}
+
+function formatMcpToolResult(result: unknown): string {
+  const root = isRecord(result) ? result : {};
+  const content = root.content;
+  const parts = Array.isArray(content)
+    ? content.map((item) => {
+        if (!isRecord(item)) return safeStringify(item);
+        if (item.type === "text" && typeof item.text === "string") {
+          return item.text;
+        }
+        return safeStringify(item);
+      })
+    : [];
+  const structured = root.structuredContent;
+  const structuredText =
+    structured === undefined ? "" : `Structured content:\n${safeStringify(structured)}`;
+  const body = [...parts, structuredText].filter(Boolean).join("\n\n");
+  const fallback = body || safeStringify(result);
+  const prefix =
+    isRecord(result) && result.isError === true
+      ? "MCP tool reported an error.\n\n"
+      : "";
+  return limitMcpResult(`${prefix}${fallback}`);
+}
+
+function mergeUsage(
+  previous: UIMessage["usage"],
+  next: UIMessage["usage"],
+): UIMessage["usage"] {
+  if (!next) return previous;
+  if (!previous) return next;
+  return {
+    inputTokens: previous.inputTokens + next.inputTokens,
+    outputTokens: previous.outputTokens + next.outputTokens,
+    cachedInputTokens:
+      (previous.cachedInputTokens ?? 0) + (next.cachedInputTokens ?? 0),
+    cacheWriteInputTokens:
+      (previous.cacheWriteInputTokens ?? 0) +
+      (next.cacheWriteInputTokens ?? 0),
+  };
+}
+
+function cacheControlForTTL(
+  cacheTTLMode: ClaudePromptCacheTTL,
+): ChatTextContentPart["cache_control"] | undefined {
+  const ttl = promptCacheTTL(cacheTTLMode);
+  if (!ttl) return undefined;
+  return {
+    type: "ephemeral",
+    ...(ttl === "1h" ? { ttl } : {}),
+  };
+}
+
+function withCacheControlOnContent(
+  content: ChatMessage["content"],
+  cacheTTLMode: ClaudePromptCacheTTL,
+  trailingPart?: ChatTextContentPart,
+): ChatMessage["content"] {
+  const cacheControl = cacheControlForTTL(cacheTTLMode);
+  if (!cacheControl) return content;
+
+  if (content == null) {
+    return trailingPart ? [trailingPart] : "";
+  }
+
+  if (typeof content === "string") {
+    return [
+      { type: "text", text: content, cache_control: cacheControl },
+      ...(trailingPart ? [trailingPart] : []),
+    ];
+  }
+
+  const next: ChatContentPart[] = content.map((part) =>
+    part.type === "text"
+      ? { type: "text", text: part.text }
+      : { ...part },
+  );
+  const textIndex = next.findLastIndex((part) => part.type === "text");
+  if (textIndex === -1) {
+    next.push({ type: "text", text: "", cache_control: cacheControl });
+    if (trailingPart) next.push(trailingPart);
+    return next;
+  }
+
+  const part = next[textIndex];
+  if (part.type === "text") {
+    next[textIndex] = { ...part, cache_control: cacheControl };
+  }
+  if (trailingPart) next.push(trailingPart);
+  return next;
+}
+
+function withCacheControlOnLastMessage(
+  messages: ChatMessage[],
+  cacheTTLMode: ClaudePromptCacheTTL,
+  trailingPart?: ChatTextContentPart,
+): ChatMessage[] {
+  if (messages.length === 0) return messages;
+  const lastIndex = messages.length - 1;
+  return messages.map((message, index) =>
+    index === lastIndex
+      ? {
+          ...message,
+          content: withCacheControlOnContent(
+            message.content,
+            cacheTTLMode,
+            trailingPart,
+          ),
+        }
+      : message,
+  );
+}
+
+async function generateConversationTitle(
+  provider: ReturnType<typeof createProvider>,
+  model: string,
+  promptMessages: StoredMessage[],
+  assistantText: string,
+): Promise<string> {
+  const conversationText = [
+    ...promptMessages.map((message) => {
+      const label = message.role === "user" ? "User" : "Assistant";
+      return `${label}: ${contentBlocksToPlainText(message.content, true)}`;
+    }),
+    `Assistant: ${assistantText}`,
+  ].join("\n\n");
+
+  const response = await provider.sendMessage({
+    model,
+    maxTokens: 64,
+    temperature: 0.2,
+    messages: [
+      {
+        role: "user",
+        content:
+          "Create a concise chat window title for the conversation below. " +
+          "Return only the title, without quotes. Use the conversation's main language. " +
+          "Keep it under 8 words.\n\n" +
+          conversationText.slice(0, 8000),
+      },
+    ],
+  });
+
+  return normalizeGeneratedTitle(contentBlocksToPlainText(response.content, true));
+}
+
+function assistantBlocksFromText(
+  thinkingText: string,
+  responseText: string,
+  voiceMessagesEnabled: boolean,
+  voiceBudgetTokens: number,
+): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
+  if (thinkingText) blocks.push({ type: "thinking", text: thinkingText });
+
+  const textBlocks = voiceMessagesEnabled
+    ? parseVoiceMessageBlocks(responseText, voiceBudgetTokens)
+    : responseText
+      ? [{ type: "text" as const, text: responseText }]
+      : [];
+  blocks.push(...textBlocks);
+  return blocks;
+}
+
+function assistantBlocksWithTools(
+  thinkingText: string,
+  responseText: string,
+  toolBlocks: ToolBlock[],
+  voiceMessagesEnabled: boolean,
+  voiceBudgetTokens: number,
+): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
+  if (thinkingText) blocks.push({ type: "thinking", text: thinkingText });
+  blocks.push(...toolBlocks);
+  blocks.push(
+    ...assistantBlocksFromText(
+      "",
+      responseText,
+      voiceMessagesEnabled,
+      voiceBudgetTokens,
+    ),
+  );
+  return blocks;
+}
+
+function stripMultiMessageTags(text: string): string {
+  return text.replace(/<\/?message>/gi, "");
+}
+
+function splitMultiMessageText(text: string): string[] {
+  if (!text.trim()) return [];
+
+  const messagePattern = /<message>([\s\S]*?)<\/message>/gi;
+  const parts: string[] = [];
+  let cursor = 0;
+
+  for (const match of text.matchAll(messagePattern)) {
+    const start = match.index ?? 0;
+    const before = text.slice(cursor, start).trim();
+    if (before) parts.push(stripMultiMessageTags(before).trim());
+
+    const messageText = match[1].trim();
+    if (messageText) parts.push(messageText);
+
+    cursor = start + match[0].length;
+  }
+
+  const after = text.slice(cursor).trim();
+  if (after) parts.push(stripMultiMessageTags(after).trim());
+
+  const cleaned = parts.filter(Boolean);
+  return cleaned.length > 0 ? cleaned : [stripMultiMessageTags(text).trim()];
+}
+
+function assistantMessageContentSets(
+  thinkingText: string,
+  responseText: string,
+  toolBlocks: ToolBlock[],
+  multiMessageEnabled: boolean,
+  voiceMessagesEnabled: boolean,
+  voiceBudgetTokens: number,
+): ContentBlock[][] {
+  const messageTexts = multiMessageEnabled
+    ? splitMultiMessageText(responseText)
+    : [responseText];
+
+  if (messageTexts.length <= 1) {
+    return [
+      assistantBlocksWithTools(
+        thinkingText,
+        messageTexts[0] ?? responseText,
+        toolBlocks,
+        voiceMessagesEnabled,
+        voiceBudgetTokens,
+      ),
+    ];
+  }
+
+  return messageTexts.map((messageText, index) =>
+    assistantBlocksWithTools(
+      index === 0 ? thinkingText : "",
+      messageText,
+      index === 0 ? toolBlocks : [],
+      voiceMessagesEnabled,
+      voiceBudgetTokens,
+    ),
+  );
+}
+
+function parseVoiceMessageBlocks(
+  text: string,
+  budgetTokens: number,
+): ContentBlock[] {
+  if (!text) return [];
+
+  const blocks: ContentBlock[] = [];
+  const normalizedText = normalizeVoiceTranscriptMarkers(text);
+  const voicePattern = /<voice>([\s\S]*?)<\/voice>/gi;
+  let cursor = 0;
+  let spentTokens = 0;
+
+  for (const match of normalizedText.matchAll(voicePattern)) {
+    const start = match.index ?? 0;
+    const before = normalizedText.slice(cursor, start);
+    if (before) blocks.push({ type: "text", text: before });
+
+    const voiceText = match[1].trim();
+    const tokenEstimate = estimateTokens(voiceText);
+    if (
+      voiceText &&
+      budgetTokens > 0 &&
+      spentTokens + tokenEstimate <= budgetTokens
+    ) {
+      blocks.push({
+        type: "voice",
+        id: uid(),
+        text: voiceText,
+        status: "pending",
+      });
+      spentTokens += tokenEstimate;
+    } else if (voiceText) {
+      blocks.push({ type: "text", text: voiceText });
+    }
+
+    cursor = start + match[0].length;
+  }
+
+  const after = normalizedText.slice(cursor);
+  if (after) blocks.push({ type: "text", text: after });
+
+  return mergeAdjacentTextBlocks(blocks).filter(
+    (block) => block.type !== "text" || block.text.trim(),
+  );
+}
+
+function normalizeVoiceTranscriptMarkers(text: string): string {
+  const markerPattern = /^\s*\[Voice message transcript\]\s*\n?/im;
+  if (!markerPattern.test(text)) return text;
+  return text.replace(markerPattern, "<voice>") + "</voice>";
+}
+
+function mergeAdjacentTextBlocks(blocks: ContentBlock[]): ContentBlock[] {
+  const merged: ContentBlock[] = [];
+  for (const block of blocks) {
+    const previous = merged[merged.length - 1];
+    if (block.type === "text" && previous?.type === "text") {
+      previous.text += block.text;
+    } else {
+      merged.push(block);
+    }
+  }
+  return merged;
+}
+
+function contentHasPendingVoice(content: ContentBlock[]): boolean {
+  return content.some((block) => block.type === "voice" && block.status === "pending");
+}
+
+function canSynthesizeSpeechWithProfile(
+  profile: ReturnType<typeof getActiveTtsProfile>,
+): boolean {
+  return Boolean(
+    profile && (profile.provider !== "edge" || profile.baseUrl.trim()),
+  );
+}
+
+function formatMessageTimestamp(timestamp: number | undefined): string {
+  if (!timestamp) return "";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "";
+
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+
+  return new Intl.DateTimeFormat(undefined, {
+    ...(sameDay
+      ? {}
+      : {
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        }),
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function currentTimePromptContent(now = new Date()): ChatTextContentPart {
+  const timeZone =
+    Intl.DateTimeFormat().resolvedOptions().timeZone || "local browser time";
+  const formatted = new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  }).format(now);
+
+  return {
+    type: "text",
+    text:
+      "# Current Time\n" +
+      `Current local date and time: ${formatted}\n` +
+      `Time zone: ${timeZone}\n` +
+      "Use this timestamp as the reference for relative time expressions such as today, tomorrow, yesterday, now, and later.",
+  };
+}
+
+function voiceMessagePromptContent(budgetTokens: number): ChatTextContentPart {
+  return {
+    type: "text",
+    text:
+      "# Voice Messages\n" +
+      "You may choose to send voice content when it would feel more natural, warm, expressive, or concise than plain text.\n" +
+      "To send voice, wrap only the spoken segment in <voice>...</voice>. Text outside those tags stays as normal written chat.\n" +
+      "You can make the whole reply a voice message by returning only one <voice>...</voice> segment, or mix text and one or more voice segments.\n" +
+      `Keep the total text inside all <voice> tags within about ${budgetTokens} tokens. ` +
+      "Do not mention these tags to the user. Do not put code, tables, long lists, or tool output inside voice tags.",
+  };
+}
+
+function multiMessagePromptContent(): ChatTextContentPart {
+  return {
+    type: "text",
+    text:
+      "# Multiple Chat Messages\n" +
+      "You may split a natural chat reply into multiple short message bubbles, similar to an instant messaging app.\n" +
+      "To split the reply, wrap each bubble in <message>...</message>. Use two to five bubbles when it improves pacing, and use a normal single reply when one bubble is clearer.\n" +
+      "Do not mention these tags to the user. Keep code blocks, tables, and tool output in one bubble.",
+  };
+}
+
+function requestSystemContent(
+  agent: Agent | null,
+  agentPromptCache: ClaudePromptCacheTTL,
+  cacheEnabled: boolean,
+  injectCurrentTime: boolean,
+  contextPromptCache: ClaudePromptCacheTTL,
+  multiMessageEnabled: boolean,
+  voiceMessagesEnabled: boolean,
+  voiceMessageBudgetTokens: number,
+): ChatTextContentPart[] | undefined {
+  const parts = agentSystemContent(agent, agentPromptCache, cacheEnabled) ?? [];
+  if (injectCurrentTime && contextPromptCache === "off") {
+    parts.push(currentTimePromptContent());
+  }
+  if (multiMessageEnabled) {
+    parts.push(multiMessagePromptContent());
+  }
+  if (voiceMessagesEnabled) {
+    parts.push(voiceMessagePromptContent(voiceMessageBudgetTokens));
+  }
+  return parts.length > 0 ? parts : undefined;
+}
+
+function normalizeAgent(agent: Agent): Agent {
+  return {
+    ...agent,
+    instructions: agent.instructions ?? "",
+    worldBook: agent.worldBook ?? "",
+  };
+}
+
+function isOpenRouterClaude(
+  provider: ProviderConfig | null,
+  model: string | null,
+): boolean {
+  if (!provider || !model) return false;
+  const baseUrl = provider.baseUrl.toLowerCase();
+  const modelId = model.toLowerCase();
+  return (
+    baseUrl.includes("openrouter.ai") &&
+    (modelId.includes("anthropic/") || modelId.includes("claude"))
+  );
+}
+
+function normalizeClaudePromptCacheMode(value: unknown): ClaudePromptCacheMode {
+  switch (value) {
+    case "5m":
+    case "agent-5m":
+      return "agent-5m";
+    case "1h":
+    case "agent-1h":
+      return "agent-1h";
+    case "context-5m":
+      return "context-5m";
+    case "context-1h":
+      return "context-1h";
+    default:
+      return DEFAULT_LEGACY_CLAUDE_PROMPT_CACHE;
+  }
+}
+
+function normalizeClaudePromptCacheTTL(
+  value: unknown,
+  fallback: ClaudePromptCacheTTL = "off",
+): ClaudePromptCacheTTL {
+  return value === "5m" || value === "1h" ? value : fallback;
+}
+
+function splitLegacyPromptCacheMode(
+  value: unknown,
+): {
+  agentPromptCache: ClaudePromptCacheTTL;
+  contextPromptCache: ClaudePromptCacheTTL;
+} {
+  const mode = normalizeClaudePromptCacheMode(value);
+  switch (mode) {
+    case "agent-5m":
+      return { agentPromptCache: "5m", contextPromptCache: "off" };
+    case "agent-1h":
+      return { agentPromptCache: "1h", contextPromptCache: "off" };
+    case "context-5m":
+      return { agentPromptCache: "off", contextPromptCache: "5m" };
+    case "context-1h":
+      return { agentPromptCache: "off", contextPromptCache: "1h" };
+    default:
+      return { agentPromptCache: "off", contextPromptCache: "off" };
+  }
+}
+
+function normalizeThinkingMode(value: unknown): ThinkingMode {
+  return value === "budget" ? "budget" : DEFAULT_THINKING_MODE;
+}
+
+function normalizeThinkingEffort(value: unknown): ThinkingEffort {
+  switch (value) {
+    case "low":
+    case "medium":
+    case "high":
+      return value;
+    default:
+      return DEFAULT_THINKING_EFFORT;
+  }
+}
+
+function normalizeTemperature(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.min(2, value))
+    : DEFAULT_TEMPERATURE;
+}
+
+function normalizeThinkingBudgetTokens(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.min(64000, Math.round(value)))
+    : DEFAULT_THINKING_BUDGET_TOKENS;
+}
+
+function normalizeVoiceMessageBudgetTokens(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.min(4000, Math.round(value)))
+    : DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS;
+}
+
+function legacyGlobalCacheMode(): ClaudePromptCacheMode {
+  try {
+    const raw = localStorage.getItem("cedar-chat.preferences");
+    if (!raw) return DEFAULT_LEGACY_CLAUDE_PROMPT_CACHE;
+    const parsed = JSON.parse(raw) as unknown;
+    return isRecord(parsed)
+      ? normalizeClaudePromptCacheMode(parsed.claudePromptCache)
+      : DEFAULT_LEGACY_CLAUDE_PROMPT_CACHE;
+  } catch {
+    return DEFAULT_LEGACY_CLAUDE_PROMPT_CACHE;
+  }
+}
+
+function promptCacheTTL(cacheTTLMode: ClaudePromptCacheTTL): "5m" | "1h" | null {
+  return cacheTTLMode === "off" ? null : cacheTTLMode;
+}
+
+function agentSections(agent: Agent | null): { title: string; text: string }[] {
+  if (!agent) return [];
+  return [
+    { title: "Profile", text: agent.profile.trim() },
+    { title: "Memory", text: agent.memory.trim() },
+    { title: "Instructions", text: agent.instructions.trim() },
+    { title: "World Book", text: agent.worldBook.trim() },
+  ].filter((section) => section.text);
+}
+
+function estimateTokens(text: string): number {
+  const cjkChars = text.match(/[\u3400-\u9fff\uf900-\ufaff]/g)?.length ?? 0;
+  const nonCjkText = text.replace(/[\u3400-\u9fff\uf900-\ufaff]/g, "");
+  const nonCjkChars = nonCjkText.replace(/\s+/g, "").length;
+  return Math.ceil(cjkChars + nonCjkChars / 4);
+}
+
+function agentFixedTokenEstimate(agent: Agent | null): number {
+  return estimateTokens(
+    agentSections(agent)
+      .map((section) => `# ${section.title}\n${section.text}`)
+      .join("\n\n"),
+  );
+}
+
+function claudeCacheMinimumTokens(model: string | null): number | null {
+  if (!model) return null;
+  const id = model.toLowerCase().replace(/\./g, "-");
+  if (
+    id.includes("opus-4-7") ||
+    id.includes("opus-4-6") ||
+    id.includes("opus-4-5") ||
+    id.includes("haiku-4-5")
+  ) {
+    return 4096;
+  }
+  if (id.includes("sonnet-4-6") || id.includes("haiku-3-5")) {
+    return 2048;
+  }
+  if (
+    id.includes("sonnet-4-5") ||
+    id.includes("sonnet-4") ||
+    id.includes("opus-4-1") ||
+    id.includes("opus-4") ||
+    id.includes("sonnet-3-7")
+  ) {
+    return 1024;
+  }
+  return 1024;
+}
+
+function agentSystemContent(
+  agent: Agent | null,
+  agentPromptCache: ClaudePromptCacheTTL,
+  cacheEnabled: boolean,
+): ChatTextContentPart[] | undefined {
+  const sections = agentSections(agent);
+
+  if (sections.length === 0) return undefined;
+
+  return sections.map((section, index) => {
+    const part: ChatTextContentPart = {
+      type: "text",
+      text: `# ${section.title}\n${section.text}`,
+    };
+    if (
+      cacheEnabled &&
+      agentPromptCache !== "off" &&
+      index === sections.length - 1
+    ) {
+      const ttl = promptCacheTTL(agentPromptCache);
+      part.cache_control = {
+        type: "ephemeral",
+        ...(ttl === "1h" ? { ttl } : {}),
+      };
+    }
+    return part;
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isAgent(value: unknown): value is Agent {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.profile === "string" &&
+    typeof value.memory === "string" &&
+    (value.instructions === undefined || typeof value.instructions === "string") &&
+    (value.worldBook === undefined || typeof value.worldBook === "string") &&
+    typeof value.createdAt === "number" &&
+    typeof value.updatedAt === "number"
+  );
+}
+
+function isContentBlock(value: unknown): value is ContentBlock {
+  if (!isRecord(value)) return false;
+  if (
+    (value.type === "text" || value.type === "thinking") &&
+    typeof value.text === "string"
+  ) {
+    return true;
+  }
+  if (value.type === "voice") {
+    return (
+      typeof value.id === "string" &&
+      typeof value.text === "string" &&
+      (value.audioUrl === undefined || typeof value.audioUrl === "string") &&
+      (value.status === undefined ||
+        value.status === "pending" ||
+        value.status === "ready" ||
+        value.status === "error") &&
+      (value.error === undefined || typeof value.error === "string")
+    );
+  }
+  if (value.type === "tool") {
+    return (
+      typeof value.id === "string" &&
+      typeof value.name === "string" &&
+      (value.status === "pending" ||
+        value.status === "success" ||
+        value.status === "error") &&
+      (value.input === undefined || typeof value.input === "string") &&
+      (value.output === undefined || typeof value.output === "string") &&
+      (value.error === undefined || typeof value.error === "string")
+    );
+  }
+  return value.type === "attachment" && isChatAttachment(value.attachment);
+}
+
+function isChatAttachment(value: unknown): value is ChatAttachment {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.mediaType === "string" &&
+    typeof value.size === "number" &&
+    (value.kind === "image" ||
+      value.kind === "text" ||
+      value.kind === "code" ||
+      value.kind === "notebook" ||
+      value.kind === "pdf" ||
+      value.kind === "other") &&
+    (value.text === undefined || typeof value.text === "string") &&
+    (value.dataUrl === undefined || typeof value.dataUrl === "string") &&
+    (value.error === undefined || typeof value.error === "string")
+  );
+}
+
+function isStoredMessage(value: unknown): value is StoredMessage {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    (value.role === "user" || value.role === "assistant") &&
+    Array.isArray(value.content) &&
+    value.content.every(isContentBlock) &&
+    (value.createdAt === undefined || typeof value.createdAt === "number")
+  );
+}
+
+function isConversation(value: unknown): value is Conversation {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    (value.agentId === undefined ||
+      value.agentId === null ||
+      typeof value.agentId === "string") &&
+    (value.providerId === undefined ||
+      value.providerId === null ||
+      typeof value.providerId === "string") &&
+    (value.model === undefined ||
+      value.model === null ||
+      typeof value.model === "string") &&
+    (value.temperature === undefined || typeof value.temperature === "number") &&
+    (value.reasoningEnabled === undefined ||
+      typeof value.reasoningEnabled === "boolean") &&
+    (value.thinkingMode === undefined ||
+      typeof value.thinkingMode === "string") &&
+    (value.thinkingEffort === undefined ||
+      typeof value.thinkingEffort === "string") &&
+    (value.thinkingBudgetTokens === undefined ||
+      typeof value.thinkingBudgetTokens === "number") &&
+    (value.agentPromptCache === undefined ||
+      typeof value.agentPromptCache === "string") &&
+    (value.contextPromptCache === undefined ||
+      typeof value.contextPromptCache === "string") &&
+    (value.claudePromptCache === undefined ||
+      typeof value.claudePromptCache === "string") &&
+    (value.showMessageTimestamps === undefined ||
+      typeof value.showMessageTimestamps === "boolean") &&
+    (value.injectCurrentTime === undefined ||
+      typeof value.injectCurrentTime === "boolean") &&
+    (value.multiMessageEnabled === undefined ||
+      typeof value.multiMessageEnabled === "boolean") &&
+    (value.voiceMessagesEnabled === undefined ||
+      typeof value.voiceMessagesEnabled === "boolean") &&
+    (value.voiceMessageBudgetTokens === undefined ||
+      typeof value.voiceMessageBudgetTokens === "number") &&
+    typeof value.title === "string" &&
+    typeof value.createdAt === "number" &&
+    typeof value.updatedAt === "number" &&
+    Array.isArray(value.messages) &&
+    value.messages.every(isStoredMessage)
+  );
+}
+
+function agentsFromImport(value: unknown): Agent[] {
+  if (isRecord(value) && Array.isArray(value.agents)) {
+    return value.agents.filter(isAgent).map(normalizeAgent);
+  }
+  return [];
+}
+
+function conversationsFromImport(value: unknown): Conversation[] {
+  if (Array.isArray(value)) {
+    return value.filter(isConversation);
+  }
+  if (isRecord(value) && Array.isArray(value.conversations)) {
+    return value.conversations.filter(isConversation);
+  }
+  return [];
+}
+
+function normalizeConversationsForAgents(
+  conversations: Conversation[],
+  agents: Agent[],
+  fallbackAgentId: string | null,
+  fallbackCacheMode: ClaudePromptCacheMode,
+): Conversation[] {
+  const agentIds = new Set(agents.map((agent) => agent.id));
+  const fallbackCurrent = loadCurrent();
+  return conversations.map((conversation) => ({
+    ...conversation,
+    agentId:
+      conversation.agentId && agentIds.has(conversation.agentId)
+        ? conversation.agentId
+        : fallbackAgentId,
+    providerId:
+      typeof conversation.providerId === "string"
+        ? conversation.providerId
+        : fallbackCurrent.providerId,
+    model:
+      typeof conversation.model === "string"
+        ? conversation.model
+        : fallbackCurrent.model,
+    temperature: normalizeTemperature(conversation.temperature),
+    reasoningEnabled:
+      typeof conversation.reasoningEnabled === "boolean"
+        ? conversation.reasoningEnabled
+        : DEFAULT_REASONING_ENABLED,
+    thinkingMode: normalizeThinkingMode(conversation.thinkingMode),
+    thinkingEffort: normalizeThinkingEffort(conversation.thinkingEffort),
+    thinkingBudgetTokens: normalizeThinkingBudgetTokens(
+      conversation.thinkingBudgetTokens,
+    ),
+    agentPromptCache: normalizeClaudePromptCacheTTL(
+      conversation.agentPromptCache,
+      splitLegacyPromptCacheMode(
+        conversation.claudePromptCache ?? fallbackCacheMode,
+      ).agentPromptCache,
+    ),
+    contextPromptCache: normalizeClaudePromptCacheTTL(
+      conversation.contextPromptCache,
+      splitLegacyPromptCacheMode(
+        conversation.claudePromptCache ?? fallbackCacheMode,
+      ).contextPromptCache,
+    ),
+    showMessageTimestamps: conversation.showMessageTimestamps ?? false,
+    injectCurrentTime: conversation.injectCurrentTime ?? false,
+    multiMessageEnabled:
+      conversation.multiMessageEnabled ?? DEFAULT_MULTI_MESSAGE_ENABLED,
+    voiceMessagesEnabled:
+      conversation.voiceMessagesEnabled ?? DEFAULT_VOICE_MESSAGES_ENABLED,
+    voiceMessageBudgetTokens: normalizeVoiceMessageBudgetTokens(
+      conversation.voiceMessageBudgetTokens,
+    ),
+    messages: conversation.messages.map(stripTransient),
+  }));
+}
+
+function loadInitialChatState(): {
+  agents: Agent[];
+  activeAgentId: string | null;
+  conversations: Conversation[];
+  activeConversationId: string | null;
+} {
+  const savedAgents = loadAgents().filter(isAgent).map(normalizeAgent);
+  const agents = savedAgents.length > 0 ? savedAgents : [createDefaultAgent()];
+  const fallbackCacheMode = legacyGlobalCacheMode();
+  const savedActiveAgentId = loadActiveAgentId();
+  const activeAgentId = agents.some((a) => a.id === savedActiveAgentId)
+    ? savedActiveAgentId
+    : (agents[0]?.id ?? null);
+
+  const saved = loadConversations();
+  const conversations =
+    saved.length > 0
+      ? normalizeConversationsForAgents(
+          saved,
+          agents,
+          activeAgentId,
+          fallbackCacheMode,
+        )
+      : [createEmptyConversation(activeAgentId)];
+  const activeId = loadActiveConversationId();
+  const firstForAgent =
+    conversations.find((conversation) => conversation.agentId === activeAgentId)
+      ?.id ?? conversations[0]?.id ?? null;
+
+  return {
+    agents,
+    activeAgentId,
+    conversations,
+    activeConversationId: conversations.some((c) => c.id === activeId)
+      ? activeId
+      : firstForAgent,
+  };
+}
+
+// ------------------------- App -------------------------
+
+export default function App() {
+  // --- Provider config state ---
+  const [providers, setProviders] = useState<ProviderConfig[]>(() =>
+    loadProviders(),
+  );
+  const [currentProviderId, setCurrentProviderId] = useState<string | null>(
+    () => loadCurrent().providerId,
+  );
+  const [currentModel, setCurrentModel] = useState<string | null>(
+    () => loadCurrent().model,
+  );
+  const [preferences, setPreferences] = useState<Preferences>(() =>
+    loadPreferences(),
+  );
+  const [ttsSettings, setTtsSettings] = useState<TtsSettings>(() =>
+    loadTtsSettings(),
+  );
+  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>(() =>
+    loadMcpServers(),
+  );
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("providers");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const [chatState, setChatState] = useState(loadInitialChatState);
+  const agents = chatState.agents;
+  const activeAgentId = chatState.activeAgentId;
+  const conversations = chatState.conversations;
+  const activeConversationId = chatState.activeConversationId;
+
+  function setConversations(
+    next:
+      | Conversation[]
+      | ((previousConversations: Conversation[]) => Conversation[]),
+  ) {
+    setChatState((previous) => ({
+      ...previous,
+      conversations:
+        typeof next === "function" ? next(previous.conversations) : next,
+    }));
+  }
+
+  function setActiveConversationId(id: string | null) {
+    setChatState((previous) => ({ ...previous, activeConversationId: id }));
+  }
+
+  function selectAgent(agentId: string) {
+    setChatState((previous) => {
+      const existing = previous.conversations.find(
+        (conversation) => conversation.agentId === agentId,
+      );
+      if (existing) {
+        return {
+          ...previous,
+          activeAgentId: agentId,
+          activeConversationId: existing.id,
+        };
+      }
+
+      const conversation = createEmptyConversation(agentId);
+      return {
+        ...previous,
+        conversations: [conversation, ...previous.conversations],
+        activeAgentId: agentId,
+        activeConversationId: conversation.id,
+      };
+    });
+    setSidebarOpen(false);
+    cancelEditing();
+  }
+
+  function openSettings(tab: SettingsTab = "providers") {
+    setSettingsTab(tab);
+    setSettingsOpen(true);
+  }
+
+  // --- Chat state ---
+  const activeAgent = useMemo(
+    () => agents.find((agent) => agent.id === activeAgentId) ?? agents[0] ?? null,
+    [activeAgentId, agents],
+  );
+  const agentConversations = useMemo(
+    () =>
+      activeAgent
+        ? conversations.filter(
+            (conversation) => conversation.agentId === activeAgent.id,
+          )
+        : conversations,
+    [activeAgent, conversations],
+  );
+  const activeConversation = useMemo(
+    () =>
+      agentConversations.find((c) => c.id === activeConversationId) ??
+      agentConversations[0] ??
+      null,
+    [activeConversationId, agentConversations],
+  );
+  const activeConversationAgent = useMemo(
+    () =>
+      agents.find((agent) => agent.id === activeConversation?.agentId) ??
+      activeAgent,
+    [activeAgent, activeConversation?.agentId, agents],
+  );
+  const messages = useMemo<UIMessage[]>(
+    () => activeConversation?.messages ?? [],
+    [activeConversation],
+  );
+  const activeTtsProfile = useMemo(
+    () => getActiveTtsProfile(ttsSettings),
+    [ttsSettings],
+  );
+  const ttsVoiceMessagesAvailable =
+    ttsSettings.enabled && canSynthesizeSpeechWithProfile(activeTtsProfile);
+  const activeAgentPromptCache =
+    activeConversation?.agentPromptCache ?? DEFAULT_AGENT_PROMPT_CACHE;
+  const activeContextPromptCache =
+    activeConversation?.contextPromptCache ?? DEFAULT_CONTEXT_PROMPT_CACHE;
+  const [input, setInput] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [attaching, setAttaching] = useState(false);
+  const [dragDepth, setDragDepth] = useState(0);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingText, setEditingText] = useState("");
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportSelectedIds, setExportSelectedIds] = useState<string[]>([]);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [agentsOpen, setAgentsOpen] = useState(false);
+  const [windowSettingsOpen, setWindowSettingsOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const [autoPlayVoiceBlockIds, setAutoPlayVoiceBlockIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
+  const abortRef = useRef<AbortController | null>(null);
+  const ttsAbortRef = useRef<AbortController | null>(null);
+  const requestedVoiceAutoplayRef = useRef<Set<string>>(new Set());
+  const voiceAudioUrlsRef = useRef<Set<string>>(new Set());
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // --- 派生值 ---
+  const activeProviderId = activeConversation?.providerId ?? currentProviderId;
+  const activeModel = activeConversation?.model ?? currentModel;
+  const temperature = activeConversation?.temperature ?? DEFAULT_TEMPERATURE;
+  const reasoningEnabled =
+    activeConversation?.reasoningEnabled ?? DEFAULT_REASONING_ENABLED;
+  const thinkingMode = activeConversation?.thinkingMode ?? DEFAULT_THINKING_MODE;
+  const effort = activeConversation?.thinkingEffort ?? DEFAULT_THINKING_EFFORT;
+  const budgetTokens =
+    activeConversation?.thinkingBudgetTokens ?? DEFAULT_THINKING_BUDGET_TOKENS;
+  const multiMessageEnabled =
+    activeConversation?.multiMessageEnabled ?? DEFAULT_MULTI_MESSAGE_ENABLED;
+  const voiceMessagesEnabled =
+    activeConversation?.voiceMessagesEnabled ?? DEFAULT_VOICE_MESSAGES_ENABLED;
+  const voiceMessageBudgetTokens =
+    activeConversation?.voiceMessageBudgetTokens ??
+    DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS;
+
+  const currentProvider = useMemo(
+    () => providers.find((p) => p.id === activeProviderId) ?? null,
+    [providers, activeProviderId],
+  );
+
+  const selectedModel = useMemo(
+    () =>
+      currentProvider && activeModel && currentProvider.models.includes(activeModel)
+        ? activeModel
+        : (currentProvider?.models[0] ?? null),
+    [activeModel, currentProvider],
+  );
+
+  const capability = useMemo(
+    () => (selectedModel ? getCapability(selectedModel) : null),
+    [selectedModel],
+  );
+  const claudeCacheAvailable = isOpenRouterClaude(currentProvider, selectedModel);
+  const agentCacheEstimate = useMemo(
+    () => agentFixedTokenEstimate(activeConversationAgent),
+    [activeConversationAgent],
+  );
+  const agentCacheMinimum = useMemo(
+    () => claudeCacheMinimumTokens(selectedModel),
+    [selectedModel],
+  );
+  const lastAssistantId = useMemo(
+    () => messages.findLast((m) => m.role === "assistant")?.id ?? null,
+    [messages],
+  );
+  const canSend = Boolean(
+    currentProvider &&
+      selectedModel &&
+      hasUserContent(input, pendingAttachments) &&
+      !attaching,
+  );
+
+  // --- 持久化副作用 ---
+  useEffect(() => {
+    saveProviders(providers);
+  }, [providers]);
+
+  useEffect(() => {
+    saveCurrent({ providerId: activeProviderId ?? null, model: selectedModel });
+  }, [activeProviderId, selectedModel]);
+
+  useEffect(() => {
+    savePreferences(preferences);
+  }, [preferences]);
+
+  useEffect(() => {
+    saveTtsSettings(ttsSettings);
+  }, [ttsSettings]);
+
+  useEffect(() => {
+    saveMcpServers(mcpServers);
+  }, [mcpServers]);
+
+  useEffect(() => {
+    saveAgents(agents);
+  }, [agents]);
+
+  useEffect(() => {
+    saveActiveAgentId(activeAgent?.id ?? null);
+  }, [activeAgent?.id]);
+
+  useEffect(() => {
+    saveConversations(conversations);
+  }, [conversations]);
+
+  useEffect(() => {
+    const nextUrls = collectObjectAudioUrls(conversations);
+    for (const url of voiceAudioUrlsRef.current) {
+      if (!nextUrls.has(url)) URL.revokeObjectURL(url);
+    }
+    voiceAudioUrlsRef.current = nextUrls;
+  }, [conversations]);
+
+  useEffect(
+    () => () => {
+      for (const url of voiceAudioUrlsRef.current) URL.revokeObjectURL(url);
+      voiceAudioUrlsRef.current.clear();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    saveActiveConversationId(activeConversation?.id ?? null);
+  }, [activeConversation?.id]);
+
+  async function synthesizeVoiceBlocks(
+    conversationId: string,
+    messageId: string,
+    content: ContentBlock[],
+    signal?: AbortSignal,
+  ) {
+    for (const block of content) {
+      if (block.type !== "voice" || block.status !== "pending") continue;
+
+      try {
+        if (!activeTtsProfile) {
+          throw new Error("Select a TTS voice profile first.");
+        }
+        const audioBlob = await synthesizeSpeech(
+          activeTtsProfile,
+          block.text,
+          signal,
+        );
+        const audioUrl = URL.createObjectURL(audioBlob);
+        updateVoiceBlock(conversationId, messageId, block.id, {
+          status: "ready",
+          audioUrl,
+        });
+        requestVoiceAutoplay(block.id);
+      } catch (error: unknown) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          throw error;
+        }
+        updateVoiceBlock(conversationId, messageId, block.id, {
+          status: "error",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  function updateVoiceBlock(
+    conversationId: string,
+    messageId: string,
+    voiceBlockId: string,
+    patch: Partial<VoiceBlock>,
+  ) {
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              messages: conversation.messages.map((message) =>
+                message.id === messageId
+                  ? {
+                      ...message,
+                      content: message.content.map((block) =>
+                        block.type === "voice" && block.id === voiceBlockId
+                          ? { ...block, ...patch }
+                          : block,
+                      ),
+                    }
+                  : message,
+              ),
+              updatedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    );
+  }
+
+  function requestVoiceAutoplay(voiceBlockId: string) {
+    if (requestedVoiceAutoplayRef.current.has(voiceBlockId)) return;
+    requestedVoiceAutoplayRef.current.add(voiceBlockId);
+    setAutoPlayVoiceBlockIds((prev) => {
+      if (prev.has(voiceBlockId)) return prev;
+      const next = new Set(prev);
+      next.add(voiceBlockId);
+      return next;
+    });
+  }
+
+  function consumeVoiceAutoplay(voiceBlockId: string) {
+    setAutoPlayVoiceBlockIds((prev) => {
+      if (!prev.has(voiceBlockId)) return prev;
+      const next = new Set(prev);
+      next.delete(voiceBlockId);
+      return next;
+    });
+  }
+
+  async function runAssistantStream(
+    conversationId: string,
+    promptMessages: StoredMessage[],
+    assistantMessage: UIMessage,
+    systemContent: ChatTextContentPart[] | undefined,
+    contextPromptCache: ClaudePromptCacheTTL,
+    injectCurrentTime: boolean,
+    shouldGenerateTitle = false,
+  ) {
+    if (!currentProvider || !selectedModel || busy) return;
+    setBusy(true);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const assistantMessageId = assistantMessage.id;
+
+    try {
+      const provider = createProvider(currentProvider);
+      const cap = getCapability(selectedModel);
+      const activeMcpTools = await prepareMcpTools(mcpServers);
+      const mcpToolByName = new Map(
+        activeMcpTools.map((tool) => [tool.functionName, tool]),
+      );
+      const chatTools = activeMcpTools.map((tool) => tool.chatTool);
+
+      // 构造请求 - 只传当前模型实际支持的字段，剩下的 provider 内部会再过一遍
+      // historyDepth: 取最后 N 条上下文；普通发送时 promptMessages 已经包含新用户消息
+      const trimmed =
+        preferences.historyDepth === "all"
+          ? promptMessages
+          : promptMessages.slice(-Math.max(preferences.historyDepth + 1, 1));
+      const contextCacheEnabled =
+        claudeCacheAvailable && contextPromptCache !== "off";
+      const currentTimeAfterCache =
+        contextCacheEnabled && injectCurrentTime;
+      const requestMessages: ChatMessage[] = trimmed.map((m) => ({
+        role: m.role,
+        content: requestContentFromBlocks(m.content),
+      }));
+      const finalRequestMessages = currentTimeAfterCache
+        ? withCacheControlOnLastMessage(
+            requestMessages,
+            contextPromptCache,
+            currentTimePromptContent(),
+          )
+        : requestMessages;
+      let modelMessages: ChatMessage[] = finalRequestMessages;
+
+      // 流式累积
+      let textBuf = "";
+      let thinkingBuf = "";
+      let toolBlocks: ToolBlock[] = [];
+      let finalUsage: UIMessage["usage"] = undefined;
+      let stoppedByToolRoundLimit = false;
+
+      const commitAssistantBlocks = (blocks: ContentBlock[]) => {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === assistantMessageId
+                      ? { ...m, content: blocks, usage: finalUsage }
+                      : m,
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : c,
+          ),
+        );
+      };
+      const replaceAssistantMessages = (assistantMessages: StoredMessage[]) => {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  messages: c.messages.flatMap((m) =>
+                    m.id === assistantMessageId ? assistantMessages : [m],
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : c,
+          ),
+        );
+      };
+
+      const commonRequest = {
+        model: selectedModel,
+        systemContent,
+        promptCache:
+          contextCacheEnabled &&
+          !currentTimeAfterCache
+            ? {
+                type: "ephemeral" as const,
+                ...(promptCacheTTL(contextPromptCache) === "1h"
+                  ? { ttl: "1h" as const }
+                  : {}),
+              }
+            : undefined,
+        temperature: cap.supportsSampling ? temperature : undefined,
+        reasoning:
+          cap.isReasoning && reasoningEnabled
+            ? (() => {
+                // 二选一：同上一段 UI 的逻辑保持一致
+                const useEffort =
+                  cap.thinkingEffort &&
+                  (!cap.thinkingBudget || thinkingMode === "effort");
+                const useBudget =
+                  cap.thinkingBudget &&
+                  (!cap.thinkingEffort || thinkingMode === "budget");
+                return {
+                  enabled: true,
+                  effort: useEffort ? effort : undefined,
+                  budgetTokens: useBudget ? budgetTokens : undefined,
+                };
+              })()
+            : undefined,
+        tools: chatTools.length > 0 ? chatTools : undefined,
+        toolChoice: chatTools.length > 0 ? ("auto" as const) : undefined,
+        signal: controller.signal,
+      };
+
+      for (let round = 0; round < MAX_MCP_TOOL_ROUNDS; round += 1) {
+        const stream = provider.streamMessage({
+          ...commonRequest,
+          messages: modelMessages,
+        });
+        let roundText = "";
+        let toolCalls: ChatToolCall[] = [];
+
+        for await (const chunk of stream) {
+          if (chunk.usage) finalUsage = mergeUsage(finalUsage, chunk.usage);
+          if (chunk.kind === "tool_calls") {
+            toolCalls = chunk.toolCalls ?? [];
+            continue;
+          }
+          if (chunk.done) break;
+          if (chunk.kind === "thinking") thinkingBuf += chunk.delta;
+          if (chunk.kind === "text") {
+            textBuf += chunk.delta;
+            roundText += chunk.delta;
+          }
+
+          commitAssistantBlocks(
+            assistantBlocksWithTools(
+              thinkingBuf,
+              multiMessageEnabled ? stripMultiMessageTags(textBuf) : textBuf,
+              toolBlocks,
+              false,
+              voiceMessageBudgetTokens,
+            ),
+          );
+        }
+
+        if (toolCalls.length === 0) {
+          if (round === 0 && chatTools.length > 0 && !textBuf.trim()) {
+            textBuf +=
+              "\n\nError: the model ended before returning text or an MCP tool call. Try a tool-calling model, or disable Thinking for this chat and retry.";
+          }
+          break;
+        }
+
+        modelMessages = [
+          ...modelMessages,
+          {
+            role: "assistant",
+            content: roundText || null,
+            tool_calls: toolCalls,
+          },
+        ];
+
+        for (const toolCall of toolCalls) {
+          const activeTool = mcpToolByName.get(toolCall.function.name);
+          const toolBlockName = activeTool?.displayName ?? toolCall.function.name;
+          const toolBlockInput = formatToolInput(toolCall.function.arguments);
+          toolBlocks = [
+            ...toolBlocks,
+            {
+              type: "tool",
+              id: toolCall.id,
+              name: toolBlockName,
+              status: "pending",
+              input: toolBlockInput,
+            },
+          ];
+          commitAssistantBlocks(
+            assistantBlocksWithTools(
+              thinkingBuf,
+              multiMessageEnabled ? stripMultiMessageTags(textBuf) : textBuf,
+              toolBlocks,
+              false,
+              voiceMessageBudgetTokens,
+            ),
+          );
+          let toolResultText: string;
+
+          if (!activeTool) {
+            toolResultText = `MCP tool ${toolCall.function.name} is not available.`;
+            toolBlocks = toolBlocks.map((block) =>
+              block.id === toolCall.id
+                ? {
+                    ...block,
+                    status: "error",
+                    error: toolResultText,
+                  }
+                : block,
+            );
+          } else {
+            try {
+              const args = parseToolArguments(toolCall.function.arguments);
+              const result = await callMcpTool(
+                activeTool.server,
+                activeTool.toolName,
+                args,
+                activeTool.sessionId,
+              );
+              activeTool.sessionId = result.sessionId;
+              toolResultText = formatMcpToolResult(result.result);
+              toolBlocks = toolBlocks.map((block) =>
+                block.id === toolCall.id
+                  ? {
+                      ...block,
+                      status: "success",
+                      output: limitToolBlockText(toolResultText),
+                    }
+                  : block,
+              );
+            } catch (error: unknown) {
+              const detail =
+                error instanceof Error ? error.message : String(error);
+              toolResultText = `MCP tool ${activeTool.displayName} failed: ${detail}`;
+              toolBlocks = toolBlocks.map((block) =>
+                block.id === toolCall.id
+                  ? {
+                      ...block,
+                      status: "error",
+                      error: detail,
+                    }
+                  : block,
+              );
+            }
+          }
+          commitAssistantBlocks(
+            assistantBlocksWithTools(
+              thinkingBuf,
+              multiMessageEnabled ? stripMultiMessageTags(textBuf) : textBuf,
+              toolBlocks,
+              false,
+              voiceMessageBudgetTokens,
+            ),
+          );
+
+          modelMessages = [
+            ...modelMessages,
+            {
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: toolResultText,
+            },
+          ];
+        }
+
+        if (round === MAX_MCP_TOOL_ROUNDS - 1) {
+          stoppedByToolRoundLimit = true;
+        }
+      }
+
+      if (stoppedByToolRoundLimit) {
+        textBuf += `\n\nError: stopped after ${MAX_MCP_TOOL_ROUNDS} MCP tool rounds.`;
+      }
+
+      const interimBlocks = assistantBlocksWithTools(
+          thinkingBuf,
+          multiMessageEnabled ? stripMultiMessageTags(textBuf) : textBuf,
+          toolBlocks,
+          false,
+          voiceMessageBudgetTokens,
+      );
+      commitAssistantBlocks(interimBlocks);
+
+      const canGenerateVoiceMessages =
+        voiceMessagesEnabled && ttsVoiceMessagesAvailable;
+      const finalContentSets = assistantMessageContentSets(
+        thinkingBuf,
+        textBuf,
+        toolBlocks,
+        multiMessageEnabled,
+        canGenerateVoiceMessages,
+        voiceMessageBudgetTokens,
+      );
+      const finalAssistantMessages = assistantMessagesFromContentSets(
+        assistantMessage,
+        finalContentSets,
+        finalUsage,
+      );
+      replaceAssistantMessages(finalAssistantMessages);
+
+      if (canGenerateVoiceMessages) {
+        for (const message of finalAssistantMessages) {
+          if (!contentHasPendingVoice(message.content)) continue;
+          await synthesizeVoiceBlocks(
+            conversationId,
+            message.id,
+            message.content,
+            controller.signal,
+          );
+        }
+      }
+
+      if (shouldGenerateTitle && textBuf.trim()) {
+        try {
+          const assistantTitleText =
+            finalAssistantMessages
+              .map((message) => contentBlocksToPlainText(message.content, true))
+              .filter(Boolean)
+              .join("\n\n") || stripMultiMessageTags(textBuf);
+          const title = await generateConversationTitle(
+            provider,
+            selectedModel,
+            promptMessages,
+            assistantTitleText,
+          );
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === conversationId
+                ? { ...c, title, updatedAt: Date.now() }
+                : c,
+            ),
+          );
+        } catch {
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === conversationId
+                ? {
+                    ...c,
+                    title: titleFromPromptMessages(promptMessages),
+                    updatedAt: Date.now(),
+                  }
+                : c,
+            ),
+          );
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      const errText = err instanceof Error ? err.message : String(err);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === conversationId
+            ? {
+                ...c,
+                messages: c.messages.map((m) =>
+                  m.id === assistantMessageId
+                    ? {
+                        ...m,
+                        content: [{ type: "text", text: `Error: ${errText}` }],
+                      }
+                    : m,
+                ),
+                updatedAt: Date.now(),
+              }
+            : c,
+        ),
+      );
+    } finally {
+      setBusy(false);
+      abortRef.current = null;
+    }
+  }
+
+  // --- 发消息 ---
+  async function handleSend() {
+    if (
+      !currentProvider ||
+      !selectedModel ||
+      !hasUserContent(input, pendingAttachments) ||
+      busy ||
+      attaching ||
+      !activeConversation
+    ) return;
+
+    const inputText = input;
+    const attachments = pendingAttachments;
+    const userContent: ContentBlock[] = [
+      ...attachments.map((attachment): ContentBlock => ({
+        type: "attachment",
+        attachment,
+      })),
+      ...(inputText.trim() ? [{ type: "text" as const, text: inputText }] : []),
+    ];
+    const shouldGenerateTitle = activeConversation.messages.length === 0;
+    const now = timestampNow();
+    const userMessage: UIMessage = {
+      id: uid(),
+      role: "user",
+      content: userContent,
+      createdAt: now,
+    };
+    const assistantMessage: UIMessage = {
+      id: uid(),
+      role: "assistant",
+      content: [],
+      createdAt: now,
+      streaming: true,
+    };
+
+    const promptMessages = [...messages, userMessage].map(stripTransient);
+    const nextMessages = [...promptMessages, stripTransient(assistantMessage)];
+    const conversationId = activeConversation.id;
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === conversationId
+          ? {
+              ...c,
+              title: c.messages.length === 0 ? "Summarizing..." : c.title,
+              messages: nextMessages,
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+    );
+    setInput("");
+    setPendingAttachments([]);
+    setAttachmentError(null);
+    await runAssistantStream(
+      conversationId,
+      promptMessages,
+      assistantMessage,
+      requestSystemContent(
+        activeConversationAgent,
+        activeAgentPromptCache,
+        claudeCacheAvailable,
+        activeConversation.injectCurrentTime,
+        activeContextPromptCache,
+        multiMessageEnabled,
+        voiceMessagesEnabled && ttsVoiceMessagesAvailable,
+        voiceMessageBudgetTokens,
+      ),
+      activeContextPromptCache,
+      activeConversation.injectCurrentTime,
+      shouldGenerateTitle,
+    );
+  }
+
+  function handleStop() {
+    abortRef.current?.abort();
+  }
+
+  function handleAttachmentClick() {
+    attachmentInputRef.current?.click();
+  }
+
+  async function addAttachmentFiles(files: File[]) {
+    if (files.length === 0) return;
+    setAttaching(true);
+    setAttachmentError(null);
+
+    const next: ChatAttachment[] = [];
+    const failures: string[] = [];
+
+    for (const file of files) {
+      try {
+        next.push(await attachmentFromFile(file));
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        failures.push(`${file.name}: ${detail}`);
+      }
+    }
+
+    if (next.length > 0) {
+      setPendingAttachments((prev) => [...prev, ...next]);
+    }
+    if (failures.length > 0) {
+      setAttachmentError(failures.join("\n"));
+    }
+    setAttaching(false);
+  }
+
+  async function handleAttachmentFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    await addAttachmentFiles(Array.from(files));
+    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+  }
+
+  function dataTransferHasFiles(dataTransfer: DataTransfer): boolean {
+    return Array.from(dataTransfer.types).includes("Files");
+  }
+
+  function handleChatDragEnter(event: DragEvent<HTMLDivElement>) {
+    if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setDragDepth((depth) => depth + 1);
+  }
+
+  function handleChatDragOver(event: DragEvent<HTMLDivElement>) {
+    if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect =
+      currentProvider && selectedModel && !busy ? "copy" : "none";
+  }
+
+  function handleChatDragLeave(event: DragEvent<HTMLDivElement>) {
+    if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setDragDepth((depth) => Math.max(0, depth - 1));
+  }
+
+  function handleChatDrop(event: DragEvent<HTMLDivElement>) {
+    if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setDragDepth(0);
+    if (!currentProvider || !selectedModel || busy) return;
+    void addAttachmentFiles(Array.from(event.dataTransfer.files));
+  }
+
+  function removePendingAttachment(id: string) {
+    setPendingAttachments((prev) =>
+      prev.filter((attachment) => attachment.id !== id),
+    );
+  }
+
+  function insertIntoChatInput(text: string) {
+    if (!text) return;
+    const target = chatInputRef.current;
+    const start = target?.selectionStart ?? input.length;
+    const end = target?.selectionEnd ?? input.length;
+    const next = input.slice(0, start) + text + input.slice(end);
+    const nextCursor = start + text.length;
+
+    setInput(next);
+    requestAnimationFrame(() => {
+      chatInputRef.current?.focus();
+      chatInputRef.current?.setSelectionRange(nextCursor, nextCursor);
+    });
+  }
+
+  function clipboardImageFiles(
+    clipboardData: DataTransfer,
+  ): File[] {
+    const files = Array.from(clipboardData.files).filter((file) =>
+      file.type.startsWith("image/"),
+    );
+    if (files.length > 0) return files.map(normalizeClipboardImageFile);
+
+    return Array.from(clipboardData.items)
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file))
+      .map(normalizeClipboardImageFile);
+  }
+
+  function normalizeClipboardImageFile(file: File, index: number): File {
+    if (file.name) return file;
+    const subtype = file.type.split("/")[1] || "png";
+    const extension = subtype === "jpeg" ? "jpg" : subtype;
+    return new File([file], `clipboard-image-${Date.now()}-${index + 1}.${extension}`, {
+      type: file.type || "image/png",
+      lastModified: Date.now(),
+    });
+  }
+
+  function handleChatPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const imageFiles = clipboardImageFiles(event.clipboardData);
+    const text = event.clipboardData.getData("text/plain");
+
+    if (imageFiles.length === 0 && !text) {
+      return;
+    }
+
+    event.preventDefault();
+    if (imageFiles.length > 0) {
+      void addAttachmentFiles(imageFiles);
+    }
+    if (text) {
+      insertIntoChatInput(text);
+    }
+  }
+
+  async function handleSpeakMessage(message: UIMessage) {
+    const text = contentBlocksToPlainText(message.content, true);
+    if (!text.trim()) return;
+    if (!ttsSettings.enabled || !activeTtsProfile) {
+      openSettings("tts");
+      return;
+    }
+
+    if (speakingMessageId === message.id) {
+      ttsAbortRef.current?.abort();
+      stopBrowserTts();
+      setSpeakingMessageId(null);
+      return;
+    }
+
+    ttsAbortRef.current?.abort();
+    stopBrowserTts();
+    const controller = new AbortController();
+    ttsAbortRef.current = controller;
+    setSpeakingMessageId(message.id);
+    try {
+      await playTts(activeTtsProfile, text, controller.signal);
+    } catch (error: unknown) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        alert(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (ttsAbortRef.current === controller) {
+        ttsAbortRef.current = null;
+        setSpeakingMessageId(null);
+      }
+    }
+  }
+
+  async function handleRegenerate(messageId: string) {
+    if (!activeConversation || !currentProvider || !selectedModel || busy) return;
+    const index = messages.findIndex((m) => m.id === messageId);
+    if (index === -1 || messages[index].role !== "assistant") return;
+
+    const promptMessages = messages.slice(0, index).map(stripTransient);
+    if (!promptMessages.some((m) => m.role === "user")) return;
+
+    const assistantMessage: UIMessage = {
+      id: uid(),
+      role: "assistant",
+      content: [],
+      createdAt: timestampNow(),
+      streaming: true,
+    };
+    const nextMessages = [...promptMessages, stripTransient(assistantMessage)];
+    const conversationId = activeConversation.id;
+
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === conversationId
+          ? { ...c, messages: nextMessages, updatedAt: Date.now() }
+          : c,
+      ),
+    );
+    await runAssistantStream(
+      conversationId,
+      promptMessages,
+      assistantMessage,
+      requestSystemContent(
+        activeConversationAgent,
+        activeAgentPromptCache,
+        claudeCacheAvailable,
+        activeConversation.injectCurrentTime,
+        activeContextPromptCache,
+        multiMessageEnabled,
+        voiceMessagesEnabled && ttsVoiceMessagesAvailable,
+        voiceMessageBudgetTokens,
+      ),
+      activeContextPromptCache,
+      activeConversation.injectCurrentTime,
+    );
+  }
+
+  async function handleContinue() {
+    if (!activeConversation || !currentProvider || !selectedModel || busy || messages.length === 0) return;
+    const promptMessages = messages.map(stripTransient);
+    if (promptMessages[promptMessages.length - 1]?.role !== "assistant") return;
+
+    const assistantMessage: UIMessage = {
+      id: uid(),
+      role: "assistant",
+      content: [],
+      createdAt: timestampNow(),
+      streaming: true,
+    };
+    const conversationId = activeConversation.id;
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === conversationId
+          ? {
+              ...c,
+              messages: [...promptMessages, stripTransient(assistantMessage)],
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+    );
+    await runAssistantStream(
+      conversationId,
+      promptMessages,
+      assistantMessage,
+      requestSystemContent(
+        activeConversationAgent,
+        activeAgentPromptCache,
+        claudeCacheAvailable,
+        activeConversation.injectCurrentTime,
+        activeContextPromptCache,
+        multiMessageEnabled,
+        voiceMessagesEnabled && ttsVoiceMessagesAvailable,
+        voiceMessageBudgetTokens,
+      ),
+      activeContextPromptCache,
+      activeConversation.injectCurrentTime,
+    );
+  }
+
+  function startEditing(message: UIMessage) {
+    if (busy || message.role !== "user") return;
+    setEditingMessageId(message.id);
+    setEditingText(textFromContent(message.content));
+  }
+
+  function cancelEditing() {
+    setEditingMessageId(null);
+    setEditingText("");
+  }
+
+  async function saveEditedMessage(messageId: string) {
+    if (!activeConversation || !currentProvider || !selectedModel || busy || !editingText.trim()) return;
+    const index = messages.findIndex((m) => m.id === messageId);
+    if (index === -1 || messages[index].role !== "user") return;
+    const preservedAttachments = messages[index].content.filter(
+      (block): block is Extract<ContentBlock, { type: "attachment" }> =>
+        block.type === "attachment",
+    );
+
+    const editedMessage: StoredMessage = {
+      ...stripTransient(messages[index]),
+      content: [...preservedAttachments, { type: "text", text: editingText }],
+      createdAt: messages[index].createdAt ?? timestampNow(),
+    };
+    const promptMessages = [
+      ...messages.slice(0, index).map(stripTransient),
+      editedMessage,
+    ];
+    const assistantMessage: UIMessage = {
+      id: uid(),
+      role: "assistant",
+      content: [],
+      createdAt: timestampNow(),
+      streaming: true,
+    };
+    const conversationId = activeConversation.id;
+    const shouldRetitle =
+      messages.findIndex((m) => m.role === "user") === index;
+
+    setEditingMessageId(null);
+    setEditingText("");
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === conversationId
+          ? {
+              ...c,
+              title: shouldRetitle ? "Summarizing..." : c.title,
+              messages: [...promptMessages, stripTransient(assistantMessage)],
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+    );
+    await runAssistantStream(
+      conversationId,
+      promptMessages,
+      assistantMessage,
+      requestSystemContent(
+        activeConversationAgent,
+        activeAgentPromptCache,
+        claudeCacheAvailable,
+        activeConversation.injectCurrentTime,
+        activeContextPromptCache,
+        multiMessageEnabled,
+        voiceMessagesEnabled && ttsVoiceMessagesAvailable,
+        voiceMessageBudgetTokens,
+      ),
+      activeContextPromptCache,
+      activeConversation.injectCurrentTime,
+      shouldRetitle,
+    );
+  }
+
+  function handleNewConversation() {
+    const conversation = createEmptyConversation(activeAgent?.id ?? null);
+    setConversations((prev) => [conversation, ...prev]);
+    setActiveConversationId(conversation.id);
+    setSidebarOpen(false);
+    setInput("");
+    setPendingAttachments([]);
+    setAttachmentError(null);
+    cancelEditing();
+  }
+
+  function handleDeleteConversation(id: string) {
+    if (!confirm("Delete this chat?")) return;
+    setChatState((previous) => {
+      const remaining = previous.conversations.filter((c) => c.id !== id);
+      const sameAgent = remaining.filter(
+        (conversation) => conversation.agentId === previous.activeAgentId,
+      );
+      const fallback =
+        sameAgent[0] ??
+        createEmptyConversation(previous.activeAgentId);
+      const conversations =
+        sameAgent.length > 0 ? remaining : [fallback, ...remaining];
+      const activeConversationId =
+        previous.activeConversationId === id
+          ? fallback.id
+          : previous.activeConversationId;
+      return { ...previous, conversations, activeConversationId };
+    });
+  }
+
+  function handleOpenExport() {
+    setExportSelectedIds(conversations.map((c) => c.id));
+    setExportOpen(true);
+  }
+
+  function handleWindowSettingsChange(patch: WindowSettingsPatch) {
+    if (!activeConversation) return;
+    if ("providerId" in patch) setCurrentProviderId(patch.providerId ?? null);
+    if ("model" in patch) setCurrentModel(patch.model ?? null);
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === activeConversation.id
+          ? {
+              ...conversation,
+              ...patch,
+              updatedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    );
+  }
+
+  function toggleExportConversation(id: string) {
+    setExportSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
+    );
+  }
+
+  function handleExportSelected() {
+    const selected = conversations
+      .filter((c) => exportSelectedIds.includes(c.id))
+      .map(stripTransientConversation);
+    if (selected.length === 0) return;
+
+    const payload: ChatExportPayload = {
+      app: "cedar-chat",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      agents: agents.filter((agent) =>
+        selected.some((conversation) => conversation.agentId === agent.id),
+      ),
+      conversations: selected,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const date = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = `cedar-chat-${date}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setExportOpen(false);
+  }
+
+  function handleImportClick() {
+    importInputRef.current?.click();
+  }
+
+  async function handleImportFile(file: File | undefined) {
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as unknown;
+      const importedAgents = agentsFromImport(parsed);
+      const imported = conversationsFromImport(parsed);
+      if (imported.length === 0) {
+        alert("No Cedar Chat conversations found in this JSON file.");
+        return;
+      }
+
+      setChatState((previous) => {
+        const mergedAgents = [
+          ...importedAgents,
+          ...previous.agents.filter(
+            (agent) =>
+              !new Set(importedAgents.map((item) => item.id)).has(agent.id),
+          ),
+        ];
+        const fallbackAgentId =
+          importedAgents[0]?.id ??
+          previous.activeAgentId ??
+          mergedAgents[0]?.id ??
+          null;
+        const normalizedImported = imported.map((conversation) => ({
+          ...conversation,
+          agentId: conversation.agentId ?? fallbackAgentId,
+          providerId: conversation.providerId ?? loadCurrent().providerId,
+          model: conversation.model ?? loadCurrent().model,
+          temperature: normalizeTemperature(conversation.temperature),
+          reasoningEnabled:
+            typeof conversation.reasoningEnabled === "boolean"
+              ? conversation.reasoningEnabled
+              : DEFAULT_REASONING_ENABLED,
+          thinkingMode: normalizeThinkingMode(conversation.thinkingMode),
+          thinkingEffort: normalizeThinkingEffort(conversation.thinkingEffort),
+          thinkingBudgetTokens: normalizeThinkingBudgetTokens(
+            conversation.thinkingBudgetTokens,
+          ),
+          agentPromptCache: normalizeClaudePromptCacheTTL(
+            conversation.agentPromptCache,
+            splitLegacyPromptCacheMode(conversation.claudePromptCache)
+              .agentPromptCache,
+          ),
+          contextPromptCache: normalizeClaudePromptCacheTTL(
+            conversation.contextPromptCache,
+            splitLegacyPromptCacheMode(conversation.claudePromptCache)
+              .contextPromptCache,
+          ),
+          showMessageTimestamps: conversation.showMessageTimestamps ?? false,
+          injectCurrentTime: conversation.injectCurrentTime ?? false,
+          multiMessageEnabled:
+            conversation.multiMessageEnabled ?? DEFAULT_MULTI_MESSAGE_ENABLED,
+          voiceMessagesEnabled:
+            conversation.voiceMessagesEnabled ?? DEFAULT_VOICE_MESSAGES_ENABLED,
+          voiceMessageBudgetTokens: normalizeVoiceMessageBudgetTokens(
+            conversation.voiceMessageBudgetTokens,
+          ),
+          messages: conversation.messages.map(stripTransient),
+        }));
+        const importedIds = new Set(normalizedImported.map((c) => c.id));
+        const remaining = previous.conversations.filter(
+          (c) => !importedIds.has(c.id),
+        );
+        const conversations = [...normalizedImported, ...remaining];
+        const activeAgentId =
+          normalizedImported[0]?.agentId ?? previous.activeAgentId;
+        return {
+          ...previous,
+          agents: mergedAgents.length > 0 ? mergedAgents : previous.agents,
+          conversations,
+          activeAgentId,
+          activeConversationId:
+            normalizedImported[0]?.id ?? previous.activeConversationId,
+        };
+      });
+      alert(`Imported ${imported.length} chat${imported.length === 1 ? "" : "s"}.`);
+    } catch {
+      alert("Could not import this JSON file.");
+    } finally {
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  }
+
+  function handleAgentsChange(nextAgents: Agent[]) {
+    if (nextAgents.length === 0) return;
+
+    setChatState((previous) => {
+      const agentIds = new Set(nextAgents.map((agent) => agent.id));
+      const fallbackAgentId = nextAgents[0].id;
+      const conversations = previous.conversations.map((conversation) =>
+        conversation.agentId && agentIds.has(conversation.agentId)
+          ? conversation
+          : { ...conversation, agentId: fallbackAgentId },
+      );
+      const activeAgentId =
+        previous.activeAgentId && agentIds.has(previous.activeAgentId)
+          ? previous.activeAgentId
+          : fallbackAgentId;
+      const activeConversation =
+        conversations.find((c) => c.id === previous.activeConversationId) ??
+        conversations.find((c) => c.agentId === activeAgentId) ??
+        createEmptyConversation(activeAgentId);
+      const hasActiveConversation = conversations.some(
+        (c) => c.id === activeConversation.id,
+      );
+
+      return {
+        ...previous,
+        agents: nextAgents,
+        conversations: hasActiveConversation
+          ? conversations
+          : [activeConversation, ...conversations],
+        activeAgentId,
+        activeConversationId: activeConversation.id,
+      };
+    });
+  }
+
+  // --- Render ---
+
+  return (
+    <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+      {sidebarOpen && (
+        <button
+          type="button"
+          className="fixed inset-0 z-40 bg-black/40 md:hidden"
+          aria-label="Close chats"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 flex w-80 max-w-[85vw] shrink-0 flex-col border-r border-neutral-200 bg-white transition-transform duration-200 dark:border-neutral-800 dark:bg-neutral-900 md:static md:z-auto md:w-72 md:max-w-none md:translate-x-0 ${
+          sidebarOpen ? "translate-x-0" : "-translate-x-full"
+        }`}
+      >
+        <div className="space-y-2 p-3 border-b border-neutral-200 dark:border-neutral-800">
+          <div className="flex items-center justify-between md:hidden">
+            <div className="font-semibold">Cedar Chat</div>
+            <button
+              onClick={() => setSidebarOpen(false)}
+              className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+            >
+              Close
+            </button>
+          </div>
+          <div className="flex gap-2">
+            <select
+              className="select min-w-0 flex-1"
+              value={activeAgent?.id ?? ""}
+              onChange={(event) => selectAgent(event.target.value)}
+            >
+              {agents.map((agent) => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={() => setAgentsOpen(true)}
+              className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+              title="Manage agents"
+            >
+              Agents
+            </button>
+          </div>
+          <button
+            onClick={handleNewConversation}
+            className="w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
+          >
+            + New chat
+          </button>
+        </div>
+        <nav className="flex-1 overflow-y-auto p-2 space-y-1">
+          {agentConversations.map((conversation) => (
+            <div
+              key={conversation.id}
+              className={`group flex items-center gap-1 rounded ${
+                conversation.id === activeConversation?.id
+                  ? "bg-neutral-100 dark:bg-neutral-800"
+                  : "hover:bg-neutral-50 dark:hover:bg-neutral-800/60"
+              }`}
+            >
+              <button
+                onClick={() => {
+                  setActiveConversationId(conversation.id);
+                  setSidebarOpen(false);
+                }}
+                className="min-w-0 flex-1 text-left px-2 py-2"
+              >
+                <div className="truncate text-sm font-medium">
+                  {conversation.title}
+                </div>
+                <div className="text-xs text-neutral-500">
+                  {conversation.messages.length} messages
+                </div>
+              </button>
+              <button
+                onClick={() => handleDeleteConversation(conversation.id)}
+                className="mr-1 rounded px-2 py-1 text-neutral-400 hover:bg-red-50 hover:text-red-600 md:opacity-0 md:group-hover:opacity-100 dark:hover:bg-red-950"
+                title="Delete chat"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </nav>
+        <div className="border-t border-neutral-200 dark:border-neutral-800 p-3 space-y-2">
+          <button
+            onClick={handleOpenExport}
+            className="w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
+          >
+            Export chats
+          </button>
+          <button
+            onClick={handleImportClick}
+            className="w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
+          >
+            Import chats
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(event) => handleImportFile(event.target.files?.[0])}
+          />
+        </div>
+      </aside>
+
+      <div
+        className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+        onDragEnter={handleChatDragEnter}
+        onDragOver={handleChatDragOver}
+        onDragLeave={handleChatDragLeave}
+        onDrop={handleChatDrop}
+      >
+      {dragDepth > 0 && (
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-blue-50/80 backdrop-blur-sm dark:bg-blue-950/70">
+          <div className="rounded border-2 border-dashed border-blue-400 bg-white px-6 py-4 text-center shadow-lg dark:bg-neutral-900">
+            <div className="text-sm font-medium text-blue-700 dark:text-blue-300">
+              Drop files to attach
+            </div>
+            <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
+              Images, text, PDF, Python, notebooks and common documents
+            </div>
+          </div>
+        </div>
+      )}
+      {/* 顶部栏 */}
+      <header className="flex items-center gap-2 border-b border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900 sm:gap-3 sm:px-4">
+        <button
+          onClick={() => setSidebarOpen(true)}
+          className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800 md:hidden"
+          aria-label="Open chats"
+        >
+          ☰
+        </button>
+        <h1 className="hidden text-base font-semibold sm:block md:text-lg">🌲 Cedar Chat</h1>
+
+        <div className="min-w-0 flex-1 text-xs text-neutral-500 dark:text-neutral-400 sm:text-sm">
+          {currentProvider && selectedModel ? (
+            <span className="block truncate">
+              {currentProvider.name} · {selectedModel}
+            </span>
+          ) : (
+            <span>No model selected</span>
+          )}
+        </div>
+
+        <div className="flex shrink-0 gap-1 sm:gap-2">
+          <button
+            onClick={() => setWindowSettingsOpen(true)}
+            disabled={!activeConversation}
+            className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800 sm:px-3"
+          >
+            <span className="hidden sm:inline">窗口设置</span>
+            <span className="sm:hidden">窗口</span>
+          </button>
+          <button
+            onClick={() => openSettings("providers")}
+            className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800 sm:px-3"
+          >
+            <span className="hidden sm:inline">⚙ Providers</span>
+            <span className="sm:hidden">⚙</span>
+          </button>
+        </div>
+      </header>
+
+      {/* 消息列表 */}
+      <main className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-4 sm:py-6">
+        <div className="max-w-3xl mx-auto space-y-4">
+          {messages.length === 0 && (
+            <div className="text-center text-neutral-500 py-16">
+              {providers.length === 0 ? (
+                <>
+                  No provider configured yet.
+                  <br />
+                  Click{" "}
+                  <button
+                    onClick={() => openSettings("providers")}
+                    className="underline text-blue-600 dark:text-blue-400"
+                  >
+                    ⚙ Providers
+                  </button>{" "}
+                  to add one.
+                </>
+              ) : (
+                <>Pick a provider and model, then say hi.</>
+              )}
+            </div>
+          )}
+          {messages.map((m) => (
+            <MessageView
+              key={m.id}
+              message={m}
+              busy={busy}
+              canChat={Boolean(currentProvider && selectedModel)}
+              showTimestamp={activeConversation?.showMessageTimestamps ?? false}
+              isEditing={editingMessageId === m.id}
+              editingText={editingText}
+              isLastAssistant={m.id === lastAssistantId}
+              canSpeak={m.role === "assistant"}
+              speaking={speakingMessageId === m.id}
+              autoPlayVoiceBlockIds={autoPlayVoiceBlockIds}
+              onEditingTextChange={setEditingText}
+              onStartEdit={() => startEditing(m)}
+              onCancelEdit={cancelEditing}
+              onSaveEdit={() => saveEditedMessage(m.id)}
+              onRegenerate={() => handleRegenerate(m.id)}
+              onContinue={handleContinue}
+              onSpeak={() => handleSpeakMessage(m)}
+              onVoiceAutoPlayAttempted={consumeVoiceAutoplay}
+            />
+          ))}
+        </div>
+      </main>
+
+      {/* 输入框 */}
+      <footer className="border-t border-neutral-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-900 sm:p-4">
+        <div className="max-w-3xl mx-auto space-y-2">
+          {pendingAttachments.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {pendingAttachments.map((attachment) => (
+                <AttachmentChip
+                  key={attachment.id}
+                  attachment={attachment}
+                  onRemove={() => removePendingAttachment(attachment.id)}
+                />
+              ))}
+            </div>
+          )}
+          {attachmentError && (
+            <div className="whitespace-pre-wrap rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+              {attachmentError}
+            </div>
+          )}
+          <div className="flex gap-2">
+            <button
+              onClick={handleAttachmentClick}
+              disabled={!currentProvider || !selectedModel || attaching || busy}
+              className="rounded border border-neutral-300 px-3 py-2 text-sm hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800"
+              title="Attach files"
+            >
+              {attaching ? "..." : "+"}
+            </button>
+            <input
+              ref={attachmentInputRef}
+              type="file"
+              multiple
+              accept="image/*,.txt,.md,.markdown,.pdf,.py,.ipynb,.json,.csv,.ts,.tsx,.js,.jsx,.html,.css,.xml,.yaml,.yml"
+              className="hidden"
+              onChange={(event) => handleAttachmentFiles(event.target.files)}
+            />
+            <textarea
+              ref={chatInputRef}
+              className="flex-1 input resize-none"
+              rows={2}
+              placeholder={
+                currentProvider && selectedModel
+                  ? "Type a message... (Enter for newline, click Send to send)"
+                  : "Configure a provider first"
+              }
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onPaste={handleChatPaste}
+              disabled={!currentProvider || !selectedModel}
+            />
+            {busy ? (
+              <button
+                onClick={handleStop}
+                className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 text-sm"
+              >
+                Stop
+              </button>
+            ) : (
+              <button
+                onClick={handleSend}
+                disabled={!canSend}
+                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+              >
+                Send
+              </button>
+            )}
+          </div>
+        </div>
+      </footer>
+
+      {/* Settings 抽屉 */}
+      <Settings
+        open={settingsOpen}
+        activeTab={settingsTab}
+        providers={providers}
+        preferences={preferences}
+        mcpServers={mcpServers}
+        ttsSettings={ttsSettings}
+        onClose={() => setSettingsOpen(false)}
+        onChange={setProviders}
+        onActiveTabChange={setSettingsTab}
+        onPreferencesChange={setPreferences}
+        onMcpServersChange={setMcpServers}
+        onTtsSettingsChange={setTtsSettings}
+      />
+      <ExportDialog
+        open={exportOpen}
+        conversations={conversations}
+        selectedIds={exportSelectedIds}
+        onClose={() => setExportOpen(false)}
+        onToggle={toggleExportConversation}
+        onSelectAll={() => setExportSelectedIds(conversations.map((c) => c.id))}
+        onSelectNone={() => setExportSelectedIds([])}
+        onExport={handleExportSelected}
+      />
+      <WindowSettingsDialog
+        open={windowSettingsOpen}
+        conversation={activeConversation}
+        providers={providers}
+        currentProvider={currentProvider}
+        selectedModel={selectedModel}
+        capability={capability}
+        claudeCacheAvailable={claudeCacheAvailable}
+        agentCacheEstimate={agentCacheEstimate}
+        agentCacheMinimum={agentCacheMinimum}
+        ttsEnabled={ttsVoiceMessagesAvailable}
+        onClose={() => setWindowSettingsOpen(false)}
+        onChange={handleWindowSettingsChange}
+      />
+      <AgentDialog
+        open={agentsOpen}
+        agents={agents}
+        activeAgentId={activeAgent?.id ?? null}
+        onClose={() => setAgentsOpen(false)}
+        onChange={handleAgentsChange}
+        onSelect={selectAgent}
+      />
+      </div>
+    </div>
+  );
+}
+
+function ExportDialog({
+  open,
+  conversations,
+  selectedIds,
+  onClose,
+  onToggle,
+  onSelectAll,
+  onSelectNone,
+  onExport,
+}: {
+  open: boolean;
+  conversations: Conversation[];
+  selectedIds: string[];
+  onClose: () => void;
+  onToggle: (id: string) => void;
+  onSelectAll: () => void;
+  onSelectNone: () => void;
+  onExport: () => void;
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <section className="relative w-full max-w-lg rounded bg-white shadow-xl dark:bg-neutral-900">
+        <header className="flex items-center justify-between border-b border-neutral-200 px-5 py-3 dark:border-neutral-800">
+          <h2 className="text-base font-semibold">Export chats</h2>
+          <button
+            onClick={onClose}
+            className="text-sm text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+          >
+            Close
+          </button>
+        </header>
+
+        <div className="p-5">
+          <div className="mb-3 flex items-center justify-between text-sm">
+            <span className="text-neutral-500">
+              {selectedIds.length} of {conversations.length} selected
+            </span>
+            <div className="flex gap-2">
+              <button
+                onClick={onSelectAll}
+                className="rounded px-2 py-1 text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950"
+              >
+                All
+              </button>
+              <button
+                onClick={onSelectNone}
+                className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              >
+                None
+              </button>
+            </div>
+          </div>
+
+          <div className="max-h-80 overflow-y-auto rounded border border-neutral-200 dark:border-neutral-800">
+            {conversations.map((conversation) => (
+              <label
+                key={conversation.id}
+                className="flex cursor-pointer items-start gap-3 border-b border-neutral-100 px-3 py-2 last:border-b-0 hover:bg-neutral-50 dark:border-neutral-800 dark:hover:bg-neutral-800/60"
+              >
+                <input
+                  type="checkbox"
+                  checked={selectedIds.includes(conversation.id)}
+                  onChange={() => onToggle(conversation.id)}
+                  className="mt-1"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">
+                    {conversation.title}
+                  </span>
+                  <span className="text-xs text-neutral-500">
+                    {conversation.messages.length} messages
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <footer className="flex justify-end gap-2 border-t border-neutral-200 px-5 py-3 dark:border-neutral-800">
+          <button
+            onClick={onClose}
+            className="rounded border border-neutral-300 px-4 py-2 text-sm hover:bg-neutral-50 dark:border-neutral-700 dark:hover:bg-neutral-800"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onExport}
+            disabled={selectedIds.length === 0}
+            className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            Export
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function WindowSettingsDialog({
+  open,
+  conversation,
+  providers,
+  currentProvider,
+  selectedModel,
+  capability,
+  claudeCacheAvailable,
+  agentCacheEstimate,
+  agentCacheMinimum,
+  ttsEnabled,
+  onClose,
+  onChange,
+}: {
+  open: boolean;
+  conversation: Conversation | null;
+  providers: ProviderConfig[];
+  currentProvider: ProviderConfig | null;
+  selectedModel: string | null;
+  capability: ModelCapability | null;
+  claudeCacheAvailable: boolean;
+  agentCacheEstimate: number;
+  agentCacheMinimum: number | null;
+  ttsEnabled: boolean;
+  onClose: () => void;
+  onChange: (patch: WindowSettingsPatch) => void;
+}) {
+  if (!open || !conversation) return null;
+
+  const showEffort =
+    capability?.thinkingEffort &&
+    (!capability.thinkingBudget || conversation.thinkingMode === "effort");
+  const showBudget =
+    capability?.thinkingBudget &&
+    (!capability.thinkingEffort || conversation.thinkingMode === "budget");
+
+  function changeProvider(providerId: string) {
+    const provider = providers.find((item) => item.id === providerId) ?? null;
+    onChange({
+      providerId: provider?.id ?? null,
+      model: provider?.models[0] ?? null,
+    });
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <section className="relative flex max-h-[90dvh] w-full max-w-2xl flex-col rounded bg-white shadow-xl dark:bg-neutral-900 sm:max-h-[82vh]">
+        <header className="flex items-center justify-between border-b border-neutral-200 px-5 py-3 dark:border-neutral-800">
+          <h2 className="text-base font-semibold">窗口设置</h2>
+          <button
+            onClick={onClose}
+            className="text-sm text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+          >
+            Close
+          </button>
+        </header>
+
+        <div className="flex-1 space-y-6 overflow-y-auto p-5">
+          <section className="space-y-3">
+            <h3 className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+              Model
+            </h3>
+            <label className="block text-sm">
+              <span className="mb-1 block text-neutral-500">Provider</span>
+              <select
+                className="select w-full"
+                value={conversation.providerId ?? ""}
+                onChange={(event) => changeProvider(event.target.value)}
+              >
+                <option value="">Select provider</option>
+                {providers.map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="block text-sm">
+              <span className="mb-1 block text-neutral-500">Model</span>
+              <select
+                className="select w-full"
+                value={selectedModel ?? ""}
+                onChange={(event) =>
+                  onChange({ model: event.target.value || null })
+                }
+                disabled={!currentProvider}
+              >
+                <option value="">Select model</option>
+                {currentProvider?.models.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </section>
+
+          <section className="space-y-3">
+            <h3 className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+              Generation
+            </h3>
+
+            {capability?.supportsSampling && (
+              <label className="block text-sm">
+                <span className="mb-2 flex items-center justify-between gap-3">
+                  <span className="text-neutral-500">Temperature</span>
+                  <span className="font-mono text-neutral-500">
+                    {conversation.temperature.toFixed(1)}
+                  </span>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={2}
+                  step={0.1}
+                  value={conversation.temperature}
+                  onChange={(event) =>
+                    onChange({
+                      temperature: normalizeTemperature(
+                        parseFloat(event.target.value),
+                      ),
+                    })
+                  }
+                  className="w-full"
+                />
+              </label>
+            )}
+
+            {capability?.isReasoning && (
+              <div className="space-y-3">
+                <label className="flex items-center justify-between gap-4 text-sm">
+                  <span className="font-medium">Thinking</span>
+                  <input
+                    type="checkbox"
+                    checked={conversation.reasoningEnabled}
+                    onChange={(event) =>
+                      onChange({ reasoningEnabled: event.target.checked })
+                    }
+                  />
+                </label>
+
+                {conversation.reasoningEnabled &&
+                  capability.thinkingEffort &&
+                  capability.thinkingBudget && (
+                    <label className="block text-sm">
+                      <span className="mb-1 block text-neutral-500">
+                        Thinking control
+                      </span>
+                      <select
+                        className="select w-full"
+                        value={conversation.thinkingMode}
+                        onChange={(event) =>
+                          onChange({
+                            thinkingMode: event.target.value as ThinkingMode,
+                          })
+                        }
+                      >
+                        <option value="effort">By effort</option>
+                        <option value="budget">By budget</option>
+                      </select>
+                    </label>
+                  )}
+
+                {conversation.reasoningEnabled && showEffort && (
+                  <label className="block text-sm">
+                    <span className="mb-1 block text-neutral-500">
+                      Effort
+                    </span>
+                    <select
+                      className="select w-full"
+                      value={conversation.thinkingEffort}
+                      onChange={(event) =>
+                        onChange({
+                          thinkingEffort: event.target.value as ThinkingEffort,
+                        })
+                      }
+                    >
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                    </select>
+                  </label>
+                )}
+
+                {conversation.reasoningEnabled && showBudget && (
+                  <label className="block text-sm">
+                    <span className="mb-1 block text-neutral-500">
+                      Thinking tokens
+                    </span>
+                    <input
+                      type="number"
+                      min={1024}
+                      max={64000}
+                      step={1024}
+                      value={conversation.thinkingBudgetTokens}
+                      onChange={(event) =>
+                        onChange({
+                          thinkingBudgetTokens: normalizeThinkingBudgetTokens(
+                            parseInt(event.target.value),
+                          ),
+                        })
+                      }
+                      className="input"
+                    />
+                  </label>
+                )}
+              </div>
+            )}
+
+            {!capability?.supportsSampling && !capability?.isReasoning && (
+              <div className="text-sm text-neutral-500">No extra controls</div>
+            )}
+          </section>
+
+          <section className="space-y-3">
+            <h3 className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+              Chat
+            </h3>
+
+            <label className="flex items-center justify-between gap-4 text-sm">
+              <span className="font-medium">AI 连发消息</span>
+              <input
+                type="checkbox"
+                checked={conversation.multiMessageEnabled}
+                onChange={(event) =>
+                  onChange({ multiMessageEnabled: event.target.checked })
+                }
+              />
+            </label>
+          </section>
+
+          <section className="space-y-3">
+            <h3 className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+              Voice messages
+            </h3>
+
+            <label className="flex items-center justify-between gap-4 text-sm">
+              <span className="font-medium">Allow AI voice messages</span>
+              <input
+                type="checkbox"
+                checked={conversation.voiceMessagesEnabled}
+                onChange={(event) =>
+                  onChange({ voiceMessagesEnabled: event.target.checked })
+                }
+              />
+            </label>
+
+            {conversation.voiceMessagesEnabled && (
+              <label className="block text-sm">
+                <span className="mb-1 block text-neutral-500">
+                  Voice budget tokens
+                </span>
+                <input
+                  type="number"
+                  min={0}
+                  max={4000}
+                  step={20}
+                  value={conversation.voiceMessageBudgetTokens}
+                  onChange={(event) =>
+                    onChange({
+                      voiceMessageBudgetTokens: normalizeVoiceMessageBudgetTokens(
+                        parseInt(event.target.value),
+                      ),
+                    })
+                  }
+                  className="input"
+                />
+              </label>
+            )}
+
+            {conversation.voiceMessagesEnabled && !ttsEnabled && (
+              <div className="text-xs text-amber-600 dark:text-amber-400">
+                Select an audio-synthesis TTS profile in Providers → 语音 before
+                the AI can send playable voice messages.
+              </div>
+            )}
+          </section>
+
+          <section className="space-y-3">
+            <h3 className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+              Prompt cache
+            </h3>
+
+            <label className="block text-sm">
+              <span className="mb-1 block text-neutral-500">
+                Agent cache
+              </span>
+              <select
+                className="select w-full"
+                value={conversation.agentPromptCache}
+                onChange={(event) =>
+                  onChange({
+                    agentPromptCache:
+                      event.target.value as ClaudePromptCacheTTL,
+                  })
+                }
+                disabled={!claudeCacheAvailable}
+              >
+                <option value="off">Off</option>
+                <option value="5m">5m</option>
+                <option value="1h">1h</option>
+              </select>
+            </label>
+
+            {claudeCacheAvailable &&
+              conversation.agentPromptCache !== "off" &&
+              agentCacheMinimum && (
+                <div
+                  className={`text-xs ${
+                    agentCacheEstimate >= agentCacheMinimum
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-amber-600 dark:text-amber-400"
+                  }`}
+                >
+                  fixed ≈ {agentCacheEstimate}/{agentCacheMinimum} tokens
+                </div>
+              )}
+
+            <label className="block text-sm">
+              <span className="mb-1 block text-neutral-500">
+                Context cache
+              </span>
+              <select
+                className="select w-full"
+                value={conversation.contextPromptCache}
+                onChange={(event) =>
+                  onChange({
+                    contextPromptCache:
+                      event.target.value as ClaudePromptCacheTTL,
+                  })
+                }
+                disabled={!claudeCacheAvailable}
+              >
+                <option value="off">Off</option>
+                <option value="5m">5m</option>
+                <option value="1h">1h</option>
+              </select>
+            </label>
+
+            <label className="flex items-center justify-between gap-4 text-sm">
+              <span className="font-medium">Show message time</span>
+              <input
+                type="checkbox"
+                checked={conversation.showMessageTimestamps}
+                onChange={(event) =>
+                  onChange({ showMessageTimestamps: event.target.checked })
+                }
+              />
+            </label>
+
+            <label className="flex items-center justify-between gap-4 text-sm">
+              <span className="font-medium">Inject current time</span>
+              <input
+                type="checkbox"
+                checked={conversation.injectCurrentTime}
+                onChange={(event) =>
+                  onChange({ injectCurrentTime: event.target.checked })
+                }
+              />
+            </label>
+          </section>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function blankAgent(): Agent {
+  const now = Date.now();
+  return {
+    id: newAgentId(),
+    name: "New agent",
+    profile: "",
+    memory: "",
+    instructions: "",
+    worldBook: "",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function AgentDialog({
+  open,
+  agents,
+  activeAgentId,
+  onClose,
+  onChange,
+  onSelect,
+}: {
+  open: boolean;
+  agents: Agent[];
+  activeAgentId: string | null;
+  onClose: () => void;
+  onChange: (agents: Agent[]) => void;
+  onSelect: (id: string) => void;
+}) {
+  const [editingId, setEditingId] = useState<string | null>(activeAgentId);
+  const editingAgent =
+    agents.find((agent) => agent.id === editingId) ??
+    agents.find((agent) => agent.id === activeAgentId) ??
+    agents[0] ??
+    null;
+
+  if (!open) return null;
+
+  function updateAgent(patch: Partial<Agent>) {
+    if (!editingAgent) return;
+    onChange(
+      agents.map((agent) =>
+        agent.id === editingAgent.id
+          ? { ...agent, ...patch, updatedAt: Date.now() }
+          : agent,
+      ),
+    );
+  }
+
+  function createAgent() {
+    const agent = blankAgent();
+    onChange([agent, ...agents]);
+    setEditingId(agent.id);
+    onSelect(agent.id);
+  }
+
+  function deleteAgent() {
+    if (!editingAgent) return;
+    if (agents.length <= 1) {
+      alert("Keep at least one agent.");
+      return;
+    }
+    if (!confirm("Delete this agent? Its chats will move to another agent.")) {
+      return;
+    }
+
+    const next = agents.filter((agent) => agent.id !== editingAgent.id);
+    const nextActive = next[0];
+    onChange(next);
+    setEditingId(nextActive.id);
+    onSelect(nextActive.id);
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-2 sm:px-4">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <section className="relative flex h-[90dvh] w-full max-w-5xl flex-col rounded bg-white shadow-xl dark:bg-neutral-900 sm:h-[80vh] sm:flex-row">
+        <aside className="max-h-52 w-full shrink-0 overflow-y-auto border-b border-neutral-200 dark:border-neutral-800 sm:max-h-none sm:w-64 sm:border-b-0 sm:border-r">
+          <div className="border-b border-neutral-200 p-3 dark:border-neutral-800">
+            <button
+              onClick={createAgent}
+              className="w-full rounded border border-neutral-300 px-3 py-2 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+            >
+              + New agent
+            </button>
+          </div>
+          <nav className="max-h-full overflow-y-auto p-2">
+            {agents.map((agent) => (
+              <button
+                key={agent.id}
+                onClick={() => setEditingId(agent.id)}
+                className={`w-full rounded px-3 py-2 text-left text-sm ${
+                  agent.id === editingAgent?.id
+                    ? "bg-neutral-100 dark:bg-neutral-800"
+                    : "hover:bg-neutral-50 dark:hover:bg-neutral-800/60"
+                }`}
+              >
+                <span className="block truncate font-medium">{agent.name}</span>
+                {agent.id === activeAgentId && (
+                  <span className="text-xs text-blue-600 dark:text-blue-400">
+                    active
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+        </aside>
+
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <header className="flex items-center justify-between border-b border-neutral-200 px-5 py-3 dark:border-neutral-800">
+            <h2 className="text-base font-semibold">Agents</h2>
+            <button
+              onClick={onClose}
+              className="text-sm text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+            >
+              Close
+            </button>
+          </header>
+
+          {editingAgent && (
+            <div className="flex-1 overflow-y-auto p-5">
+              <div className="max-w-3xl space-y-5">
+                <label className="block">
+                  <span className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+                    Name
+                  </span>
+                  <input
+                    className="input mt-1"
+                    value={editingAgent.name}
+                    onChange={(event) =>
+                      updateAgent({ name: event.target.value || "Untitled" })
+                    }
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+                    Profile
+                  </span>
+                  <textarea
+                    className="input mt-1 min-h-40 resize-y"
+                    value={editingAgent.profile}
+                    onChange={(event) =>
+                      updateAgent({ profile: event.target.value })
+                    }
+                    placeholder="Stable identity, speaking style, role, boundaries..."
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+                    Memory
+                  </span>
+                  <textarea
+                    className="input mt-1 min-h-56 resize-y"
+                    value={editingAgent.memory}
+                    onChange={(event) =>
+                      updateAgent({ memory: event.target.value })
+                    }
+                    placeholder="Long-term facts, user preferences, stable background..."
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+                    Instruction Injection
+                  </span>
+                  <textarea
+                    className="input mt-1 min-h-40 resize-y"
+                    value={editingAgent.instructions}
+                    onChange={(event) =>
+                      updateAgent({ instructions: event.target.value })
+                    }
+                    placeholder="Fixed per-agent instructions that should stay before chat history..."
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+                    Fixed World Book
+                  </span>
+                  <textarea
+                    className="input mt-1 min-h-56 resize-y"
+                    value={editingAgent.worldBook}
+                    onChange={(event) =>
+                      updateAgent({ worldBook: event.target.value })
+                    }
+                    placeholder="Stable world lore, character facts, rules, setting notes..."
+                  />
+                </label>
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onSelect(editingAgent.id)}
+                    className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
+                  >
+                    Use agent
+                  </button>
+                  <button
+                    onClick={deleteAgent}
+                    className="ml-auto rounded px-4 py-2 text-sm text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function AttachmentChip({
+  attachment,
+  onRemove,
+}: {
+  attachment: ChatAttachment;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="flex max-w-full items-center gap-2 rounded border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs text-neutral-700 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200">
+      <span className="min-w-0 truncate">
+        {attachment.name} · {formatBytes(attachment.size)}
+      </span>
+      {attachment.error && (
+        <span className="shrink-0 text-amber-600 dark:text-amber-400">
+          limited
+        </span>
+      )}
+      <button
+        onClick={onRemove}
+        className="shrink-0 rounded px-1 text-neutral-400 hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-700 dark:hover:text-neutral-100"
+        title="Remove attachment"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+function AttachmentPreview({
+  attachment,
+  compact,
+}: {
+  attachment: ChatAttachment;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={`mb-2 overflow-hidden rounded border text-left ${
+        compact
+          ? "border-blue-300 bg-white text-neutral-900"
+          : "border-neutral-200 bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900"
+      }`}
+    >
+      {attachment.kind === "image" && attachment.dataUrl && (
+        <img
+          src={attachment.dataUrl}
+          alt={attachment.name}
+          className="max-h-64 w-full object-contain bg-black/5"
+        />
+      )}
+      <div className="px-3 py-2">
+        <div className="truncate text-sm font-medium">{attachment.name}</div>
+        <div
+          className={`text-xs ${
+            compact ? "text-neutral-500" : "text-neutral-500 dark:text-neutral-400"
+          }`}
+        >
+          {attachment.kind} · {formatBytes(attachment.size)}
+        </div>
+        {attachment.error && (
+          <div className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+            {attachment.error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function VoiceMessageView({
+  block,
+  autoPlay = false,
+  onAutoPlayAttempted,
+}: {
+  block: VoiceBlock;
+  autoPlay?: boolean;
+  onAutoPlayAttempted?: (voiceBlockId: string) => void;
+}) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const autoPlayAttemptedRef = useRef(false);
+
+  useEffect(() => {
+    if (
+      !autoPlay ||
+      autoPlayAttemptedRef.current ||
+      block.status !== "ready" ||
+      !block.audioUrl
+    ) {
+      return;
+    }
+
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    autoPlayAttemptedRef.current = true;
+    audio.play().catch(() => undefined);
+    onAutoPlayAttempted?.(block.id);
+  }, [autoPlay, block.audioUrl, block.id, block.status, onAutoPlayAttempted]);
+
+  return (
+    <div className="my-2 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-neutral-900 dark:border-blue-900 dark:bg-blue-950 dark:text-neutral-100">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span className="text-xs font-medium uppercase tracking-wide text-blue-600 dark:text-blue-300">
+          语音消息
+        </span>
+        {block.status === "pending" && (
+          <span className="text-xs text-neutral-500 dark:text-neutral-400">
+            生成中...
+          </span>
+        )}
+      </div>
+      {block.audioUrl && (
+        <audio
+          ref={audioRef}
+          controls
+          src={block.audioUrl}
+          className="mb-2 w-full"
+        />
+      )}
+      {block.status === "error" && (
+        <div className="mb-2 rounded border border-red-200 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+          {block.error ?? "Voice synthesis failed."}
+        </div>
+      )}
+      <div className="whitespace-pre-wrap text-sm leading-6">{block.text}</div>
+    </div>
+  );
+}
+
+function ThinkingBlockView({
+  text,
+  streaming,
+}: {
+  text: string;
+  streaming?: boolean;
+}) {
+  return (
+    <ThinkingBlockDetails
+      key={streaming ? "streaming" : "settled"}
+      text={text}
+      initialOpen={Boolean(streaming)}
+    />
+  );
+}
+
+function ThinkingBlockDetails({
+  text,
+  initialOpen,
+}: {
+  text: string;
+  initialOpen: boolean;
+}) {
+  const [open, setOpen] = useState(initialOpen);
+  return (
+    <details
+      className="mb-2 text-sm text-neutral-500 dark:text-neutral-400 border-l-2 border-neutral-300 dark:border-neutral-600 pl-3"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="cursor-pointer select-none text-xs uppercase tracking-wide">
+        thinking
+      </summary>
+      <div className="whitespace-pre-wrap mt-1">{text}</div>
+    </details>
+  );
+}
+
+function ToolBlockView({ block }: { block: ToolBlock }) {
+  const statusLabel =
+    block.status === "pending"
+      ? "running"
+      : block.status === "success"
+        ? "done"
+        : "failed";
+  const statusClass =
+    block.status === "pending"
+      ? "text-amber-600 dark:text-amber-300"
+      : block.status === "success"
+        ? "text-emerald-600 dark:text-emerald-300"
+        : "text-red-600 dark:text-red-300";
+
+  return (
+    <details
+      className="my-2 rounded border border-neutral-200 bg-neutral-50 text-neutral-900 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+      open={block.status !== "success"}
+    >
+      <summary className="flex cursor-pointer select-none items-center justify-between gap-3 px-3 py-2 text-sm">
+        <span className="min-w-0 truncate font-medium">Tool · {block.name}</span>
+        <span className={`shrink-0 text-xs ${statusClass}`}>{statusLabel}</span>
+      </summary>
+      <div className="space-y-2 border-t border-neutral-200 px-3 py-2 dark:border-neutral-700">
+        {block.input && (
+          <div>
+            <div className="mb-1 text-xs font-medium uppercase text-neutral-400">
+              Input
+            </div>
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded bg-white p-2 text-xs leading-5 text-neutral-700 dark:bg-neutral-950 dark:text-neutral-300">
+              {block.input}
+            </pre>
+          </div>
+        )}
+        {block.output && (
+          <div>
+            <div className="mb-1 text-xs font-medium uppercase text-neutral-400">
+              Output
+            </div>
+            <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-white p-2 text-xs leading-5 text-neutral-700 dark:bg-neutral-950 dark:text-neutral-300">
+              {block.output}
+            </pre>
+          </div>
+        )}
+        {block.error && (
+          <div className="rounded border border-red-200 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+            {block.error}
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
+// ------------------------- Message component -------------------------
+
+interface MessageViewProps {
+  message: UIMessage;
+  busy: boolean;
+  canChat: boolean;
+  showTimestamp: boolean;
+  isEditing: boolean;
+  editingText: string;
+  isLastAssistant: boolean;
+  canSpeak: boolean;
+  speaking: boolean;
+  autoPlayVoiceBlockIds: ReadonlySet<string>;
+  onEditingTextChange: (value: string) => void;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onSaveEdit: () => void;
+  onRegenerate: () => void;
+  onContinue: () => void;
+  onSpeak: () => void;
+  onVoiceAutoPlayAttempted: (voiceBlockId: string) => void;
+}
+
+function MessageView({
+  message,
+  busy,
+  canChat,
+  showTimestamp,
+  isEditing,
+  editingText,
+  isLastAssistant,
+  canSpeak,
+  speaking,
+  autoPlayVoiceBlockIds,
+  onEditingTextChange,
+  onStartEdit,
+  onCancelEdit,
+  onSaveEdit,
+  onRegenerate,
+  onContinue,
+  onSpeak,
+  onVoiceAutoPlayAttempted,
+}: MessageViewProps) {
+  const isUser = message.role === "user";
+  const timestampLabel = showTimestamp
+    ? formatMessageTimestamp(message.createdAt)
+    : "";
+  return (
+    <div className={`group flex flex-col ${isUser ? "items-end" : "items-start"}`}>
+      <div
+        className={`max-w-[92%] rounded-2xl px-4 py-2.5 sm:max-w-[80%] ${
+          isUser
+            ? "bg-blue-600 text-white"
+            : "bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700"
+        }`}
+      >
+        {isEditing ? (
+          <div className="w-full max-w-[82vw] space-y-2 sm:w-96 sm:max-w-[70vw]">
+            <textarea
+              className="input min-h-24 resize-y text-neutral-900 dark:text-neutral-100"
+              value={editingText}
+              onChange={(e) => onEditingTextChange(e.target.value)}
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={onCancelEdit}
+                className="rounded px-3 py-1 text-sm text-blue-50 hover:bg-blue-500"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={onSaveEdit}
+                disabled={!canChat || !editingText.trim()}
+                className="rounded bg-white px-3 py-1 text-sm font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {message.content.length === 0 && (message.streaming || !isUser) && (
+              <span className="text-neutral-400 italic">...</span>
+            )}
+            {message.content.map((block, i) =>
+              block.type === "thinking" ? (
+                <ThinkingBlockView
+                  key={i}
+                  text={block.text}
+                  streaming={message.streaming}
+                />
+              ) : block.type === "attachment" ? (
+                <AttachmentPreview
+                  key={i}
+                  attachment={block.attachment}
+                  compact={isUser}
+                />
+              ) : block.type === "voice" ? (
+                <VoiceMessageView
+                  key={block.id}
+                  block={block}
+                  autoPlay={autoPlayVoiceBlockIds.has(block.id)}
+                  onAutoPlayAttempted={onVoiceAutoPlayAttempted}
+                />
+              ) : block.type === "tool" ? (
+                <ToolBlockView key={block.id} block={block} />
+              ) : (
+                <MarkdownText key={i} text={block.text} />
+              ),
+            )}
+          </>
+        )}
+        {message.usage && !message.streaming && (
+          <div className="mt-2 text-[11px] text-neutral-400 dark:text-neutral-500 font-mono">
+            in: {message.usage.inputTokens} · out: {message.usage.outputTokens}
+            {message.usage.cachedInputTokens !== undefined && (
+              <> · cached: {message.usage.cachedInputTokens}</>
+            )}
+            {message.usage.cacheWriteInputTokens !== undefined && (
+              <> · cache write: {message.usage.cacheWriteInputTokens}</>
+            )}
+          </div>
+        )}
+      </div>
+      {timestampLabel && (
+        <div className="mt-1 px-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+          {timestampLabel}
+        </div>
+      )}
+      {!isEditing && (
+        <div
+          className={`mt-1 flex gap-1 px-1 text-xs opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 ${
+            isUser ? "justify-end" : "justify-start"
+          }`}
+        >
+          {isUser ? (
+            <button
+              onClick={onStartEdit}
+              disabled={busy || !canChat}
+              className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+            >
+              Edit
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={onRegenerate}
+                disabled={busy || !canChat}
+                className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+              >
+                Regenerate
+              </button>
+              {isLastAssistant && (
+                <button
+                  onClick={onContinue}
+                  disabled={busy || !canChat}
+                  className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+                >
+                  Continue
+                </button>
+              )}
+              {canSpeak && (
+                <button
+                  onClick={onSpeak}
+                  disabled={busy && !speaking}
+                  className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+                >
+                  {speaking ? "停止语音" : "语音"}
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MarkdownText({ text }: { text: string }) {
+  const blocks = text.split(/```/);
+
+  return (
+    <div className="markdown-body">
+      {blocks.map((block, index) => {
+        if (index % 2 === 1) {
+          const lines = block.replace(/^\n/, "").split("\n");
+          const maybeLang = lines[0]?.trim() ?? "";
+          const hasLang = /^[\w#+.-]+$/.test(maybeLang);
+          const code = (hasLang ? lines.slice(1) : lines).join("\n").trimEnd();
+
+          return (
+            <pre key={index}>
+              <code>{code}</code>
+            </pre>
+          );
+        }
+
+        return renderMarkdownLines(block, index);
+      })}
+    </div>
+  );
+}
+
+function renderMarkdownLines(text: string, blockIndex: number) {
+  const lines = text.split("\n");
+  const nodes: React.ReactNode[] = [];
+  let listItems: string[] = [];
+
+  function flushList(key: string) {
+    if (listItems.length === 0) return;
+    nodes.push(
+      <ul key={key}>
+        {listItems.map((item, index) => (
+          <li key={index}>{renderInlineMarkdown(item)}</li>
+        ))}
+      </ul>,
+    );
+    listItems = [];
+  }
+
+  lines.forEach((line, index) => {
+    const trimmed = line.trim();
+    const listMatch = trimmed.match(/^[-*]\s+(.+)$/);
+
+    if (listMatch) {
+      listItems.push(listMatch[1]);
+      return;
+    }
+
+    flushList(`${blockIndex}-list-${index}`);
+
+    if (!trimmed) {
+      nodes.push(<div key={`${blockIndex}-blank-${index}`} className="h-2" />);
+      return;
+    }
+
+    const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const Tag = `h${heading[1].length}` as "h1" | "h2" | "h3";
+      nodes.push(
+        <Tag key={`${blockIndex}-heading-${index}`}>
+          {renderInlineMarkdown(heading[2])}
+        </Tag>,
+      );
+      return;
+    }
+
+    nodes.push(
+      <p key={`${blockIndex}-p-${index}`}>{renderInlineMarkdown(line)}</p>,
+    );
+  });
+
+  flushList(`${blockIndex}-list-end`);
+  return nodes;
+}
+
+function renderInlineMarkdown(text: string) {
+  return text.split(/(`[^`]+`)/g).map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return <code key={index}>{part.slice(1, -1)}</code>;
+    }
+    return <span key={index}>{part}</span>;
+  });
+}

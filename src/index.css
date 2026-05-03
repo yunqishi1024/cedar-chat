@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+@layer components {
+  .input {
+    @apply block w-full px-3 py-2 border border-neutral-300 dark:border-neutral-700
+           rounded bg-white dark:bg-neutral-800 text-sm
+           focus:outline-none focus:ring-2 focus:ring-blue-500;
+  }
+
+  .select {
+    @apply px-2 py-1 border border-neutral-300 dark:border-neutral-700 rounded
+           bg-white dark:bg-neutral-800 text-sm
+           focus:outline-none focus:ring-2 focus:ring-blue-500;
+  }
+
+  .markdown-body {
+    @apply text-sm leading-6;
+  }
+
+  .markdown-body p {
+    @apply my-1 whitespace-pre-wrap;
+  }
+
+  .markdown-body h1 {
+    @apply mt-3 mb-1 text-xl font-semibold;
+  }
+
+  .markdown-body h2 {
+    @apply mt-3 mb-1 text-lg font-semibold;
+  }
+
+  .markdown-body h3 {
+    @apply mt-2 mb-1 text-base font-semibold;
+  }
+
+  .markdown-body ul {
+    @apply my-2 list-disc pl-5 space-y-1;
+  }
+
+  .markdown-body pre {
+    @apply my-2 overflow-x-auto rounded bg-neutral-950 px-3 py-2 text-neutral-100;
+  }
+
+  .markdown-body code {
+    @apply rounded bg-neutral-100 px-1 py-0.5 font-mono text-[0.9em] dark:bg-neutral-700;
+  }
+
+  .markdown-body pre code {
+    @apply bg-transparent p-0 text-sm;
+  }
+
+  @media (max-width: 640px) {
+    .input,
+    .select {
+      font-size: 16px;
+    }
+  }
+}
