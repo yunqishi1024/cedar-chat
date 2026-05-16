@@ -30,6 +30,13 @@ export interface PushSyncResult {
   bytes?: number;
 }
 
+export interface CedarSyncBlobRef {
+  id: string;
+  mime: string;
+  size: number;
+  createdAt?: string;
+}
+
 interface EncryptedSyncEnvelope {
   app: "cedar-chat-sync";
   version: 1;
@@ -44,9 +51,39 @@ interface EncryptedSyncEnvelope {
   deviceName?: string;
 }
 
+interface EncryptedBlobEnvelope {
+  app: "cedar-chat-blob";
+  version: 1;
+  encrypted: true;
+  algorithm: "AES-GCM";
+  kdf: "PBKDF2-SHA256";
+  iterations: number;
+  salt: string;
+  iv: string;
+  data: string;
+  mime: string;
+  size: number;
+  createdAt: string;
+}
+
 const SYNC_KDF_ITERATIONS = 120_000;
 
 function snapshotUrl(endpoint: string): string {
+  const url = syncBaseUrl(endpoint);
+  url.pathname = `${url.pathname}/snapshot`;
+  return url.toString();
+}
+
+function blobUrl(endpoint: string, id: string): string {
+  if (!/^[A-Za-z0-9_-]{6,160}$/.test(id)) {
+    throw new Error("Invalid sync blob id.");
+  }
+  const url = syncBaseUrl(endpoint);
+  url.pathname = `${url.pathname}/blob/${id}`;
+  return url.toString();
+}
+
+function syncBaseUrl(endpoint: string): URL {
   const trimmed = endpoint.trim();
   if (!trimmed) throw new Error("Sync URL is required.");
 
@@ -63,13 +100,15 @@ function snapshotUrl(endpoint: string): string {
 
   const path = url.pathname.replace(/\/+$/, "");
   if (path.endsWith("/sync/snapshot")) {
-    url.pathname = path;
+    url.pathname = path.slice(0, -"/snapshot".length);
   } else if (path.endsWith("/sync")) {
-    url.pathname = `${path}/snapshot`;
+    url.pathname = path;
+  } else if (path.match(/\/sync\/blob\/[A-Za-z0-9_-]+$/)) {
+    url.pathname = path.replace(/\/blob\/[A-Za-z0-9_-]+$/, "");
   } else {
-    url.pathname = `${path}/sync/snapshot`;
+    url.pathname = `${path}/sync`;
   }
-  return url.toString();
+  return url;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -152,6 +191,36 @@ async function encryptSnapshot(
   };
 }
 
+async function encryptBlob(
+  blob: Blob,
+  syncCode: string,
+): Promise<EncryptedBlobEnvelope> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveSyncKey(syncCode, salt, SYNC_KDF_ITERATIONS);
+  const plaintext = new Uint8Array(await blob.arrayBuffer());
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: bytesToArrayBuffer(iv) },
+    key,
+    bytesToArrayBuffer(plaintext),
+  );
+
+  return {
+    app: "cedar-chat-blob",
+    version: 1,
+    encrypted: true,
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA256",
+    iterations: SYNC_KDF_ITERATIONS,
+    salt: bytesToBase64(salt),
+    iv: bytesToBase64(iv),
+    data: bytesToBase64(new Uint8Array(encrypted)),
+    mime: blob.type || "application/octet-stream",
+    size: blob.size,
+    createdAt: new Date().toISOString(),
+  };
+}
+
 function isEncryptedEnvelope(value: unknown): value is EncryptedSyncEnvelope {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
@@ -165,6 +234,25 @@ function isEncryptedEnvelope(value: unknown): value is EncryptedSyncEnvelope {
     typeof record.salt === "string" &&
     typeof record.iv === "string" &&
     typeof record.data === "string"
+  );
+}
+
+function isEncryptedBlobEnvelope(value: unknown): value is EncryptedBlobEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.app === "cedar-chat-blob" &&
+    record.version === 1 &&
+    record.encrypted === true &&
+    record.algorithm === "AES-GCM" &&
+    record.kdf === "PBKDF2-SHA256" &&
+    typeof record.iterations === "number" &&
+    typeof record.salt === "string" &&
+    typeof record.iv === "string" &&
+    typeof record.data === "string" &&
+    typeof record.mime === "string" &&
+    typeof record.size === "number" &&
+    typeof record.createdAt === "string"
   );
 }
 
@@ -185,6 +273,26 @@ async function decryptSnapshot(
     return JSON.parse(new TextDecoder().decode(decrypted)) as CedarSyncSnapshot;
   } catch {
     throw new Error("Could not decrypt cloud copy. Check the sync code.");
+  }
+}
+
+async function decryptBlob(
+  envelope: EncryptedBlobEnvelope,
+  syncCode: string,
+): Promise<Blob> {
+  try {
+    const salt = base64ToBytes(envelope.salt);
+    const iv = base64ToBytes(envelope.iv);
+    const data = base64ToBytes(envelope.data);
+    const key = await deriveSyncKey(syncCode, salt, envelope.iterations);
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: bytesToArrayBuffer(iv) },
+      key,
+      bytesToArrayBuffer(data),
+    );
+    return new Blob([decrypted], { type: envelope.mime });
+  } catch {
+    throw new Error("Could not decrypt audio. Check the sync code.");
   }
 }
 
@@ -269,4 +377,70 @@ export async function pullSyncSnapshot(
     return decryptSnapshot(payload, settings.syncCode.trim());
   }
   return payload as CedarSyncSnapshot;
+}
+
+export async function pushSyncBlob(
+  settings: SyncSettings,
+  id: string,
+  blob: Blob,
+): Promise<CedarSyncBlobRef> {
+  const envelope = await encryptBlob(blob, settings.syncCode.trim());
+  const body = JSON.stringify(envelope);
+  let response: Response;
+
+  try {
+    response = await fetch(blobUrl(settings.endpoint, id), {
+      method: "PUT",
+      headers: {
+        ...authHeaders(settings),
+        "Content-Type": "application/json",
+      },
+      body,
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Audio upload failed: ${message}`);
+  }
+
+  if (!response.ok) throw await responseError(response);
+
+  return {
+    id,
+    mime: envelope.mime,
+    size: envelope.size,
+    createdAt: envelope.createdAt,
+  };
+}
+
+export async function pullSyncBlob(
+  settings: SyncSettings,
+  ref: CedarSyncBlobRef,
+): Promise<Blob> {
+  let response: Response;
+
+  try {
+    response = await fetch(blobUrl(settings.endpoint, ref.id), {
+      method: "GET",
+      headers: {
+        ...authHeaders(settings),
+        Accept: "application/json, application/octet-stream",
+      },
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Audio download failed: ${message}`);
+  }
+
+  if (!response.ok) throw await responseError(response);
+
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const payload = (await response.json()) as unknown;
+    if (isEncryptedBlobEnvelope(payload)) {
+      return decryptBlob(payload, settings.syncCode.trim());
+    }
+    throw new Error("Audio blob has an unknown format.");
+  }
+
+  return response.blob();
 }

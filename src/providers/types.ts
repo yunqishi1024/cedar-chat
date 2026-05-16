@@ -129,6 +129,12 @@ export interface VoiceBlock {
   id: string;
   text: string;
   audioUrl?: string;
+  audioRef?: {
+    id: string;
+    mime: string;
+    size: number;
+    createdAt?: string;
+  };
   status?: "pending" | "ready" | "error";
   error?: string;
 }

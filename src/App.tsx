@@ -80,8 +80,11 @@ import {
   type McpToolSummary,
 } from "./lib/mcp";
 import {
+  pullSyncBlob,
   pullSyncSnapshot,
+  pushSyncBlob,
   pushSyncSnapshot,
+  type CedarSyncBlobRef,
   type CedarSyncSnapshot,
 } from "./lib/sync";
 
@@ -236,7 +239,17 @@ function stripTransientContentBlocks(content: ContentBlock[]): ContentBlock[] {
         id: block.id,
         text: block.text,
         status: "error",
+        audioRef: block.audioRef,
         error: block.error,
+      };
+    }
+    if (block.audioRef) {
+      return {
+        type: "voice",
+        id: block.id,
+        text: block.text,
+        status: "ready",
+        audioRef: block.audioRef,
       };
     }
     if (isPersistentAudioUrl(block.audioUrl)) {
@@ -292,6 +305,17 @@ function collectObjectAudioUrls(conversations: Conversation[]): Set<string> {
 
 function isPersistentAudioUrl(url: string | undefined): url is string {
   return Boolean(url?.startsWith("data:audio/"));
+}
+
+function canUseSyncBlobStorage(settings: SyncSettings): boolean {
+  return Boolean(settings.endpoint.trim() && settings.syncCode.trim().length >= 8);
+}
+
+function newVoiceBlobId(voiceBlockId: string): string {
+  const safeVoiceId = voiceBlockId.replace(/[^A-Za-z0-9_-]+/g, "_");
+  return `voice_${safeVoiceId}_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
 }
 
 function audioBlobToDataUrl(blob: Blob): Promise<string> {
@@ -1265,6 +1289,16 @@ function isAgent(value: unknown): value is Agent {
   );
 }
 
+function isVoiceAudioRef(value: unknown): value is CedarSyncBlobRef {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    typeof value.mime === "string" &&
+    typeof value.size === "number" &&
+    (value.createdAt === undefined || typeof value.createdAt === "string")
+  );
+}
+
 function isContentBlock(value: unknown): value is ContentBlock {
   if (!isRecord(value)) return false;
   if (
@@ -1278,6 +1312,7 @@ function isContentBlock(value: unknown): value is ContentBlock {
       typeof value.id === "string" &&
       typeof value.text === "string" &&
       (value.audioUrl === undefined || typeof value.audioUrl === "string") &&
+      (value.audioRef === undefined || isVoiceAudioRef(value.audioRef)) &&
       (value.status === undefined ||
         value.status === "pending" ||
         value.status === "ready" ||
@@ -2042,6 +2077,31 @@ export default function App() {
     saveActiveConversationId(activeConversation?.id ?? null);
   }, [activeConversation?.id]);
 
+  async function persistVoiceAudio(
+    blob: Blob,
+    voiceBlockId: string,
+  ): Promise<{ audioUrl: string; audioRef?: CedarSyncBlobRef }> {
+    if (canUseSyncBlobStorage(syncSettings)) {
+      try {
+        const audioRef = await pushSyncBlob(
+          syncSettings,
+          newVoiceBlobId(voiceBlockId),
+          blob,
+        );
+        return {
+          audioUrl: URL.createObjectURL(blob),
+          audioRef,
+        };
+      } catch {
+        // Keep voice playback working even if cloud blob storage is unavailable.
+      }
+    }
+
+    return {
+      audioUrl: await audioBlobToDataUrl(blob),
+    };
+  }
+
   async function synthesizeVoiceBlocks(
     conversationId: string,
     messageId: string,
@@ -2060,10 +2120,14 @@ export default function App() {
           block.text,
           signal,
         );
-        const audioUrl = await audioBlobToDataUrl(audioBlob);
+        const { audioUrl, audioRef } = await persistVoiceAudio(
+          audioBlob,
+          block.id,
+        );
         updateVoiceBlock(conversationId, messageId, block.id, {
           status: "ready",
           audioUrl,
+          audioRef,
         });
         requestVoiceAutoplay(block.id);
       } catch (error: unknown) {
@@ -2771,15 +2835,65 @@ export default function App() {
 
     try {
       const audioBlob = await synthesizeSpeech(activeTtsProfile, block.text);
-      const audioUrl = await audioBlobToDataUrl(audioBlob);
+      const { audioUrl, audioRef } = await persistVoiceAudio(
+        audioBlob,
+        voiceBlockId,
+      );
       updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
         status: "ready",
         audioUrl,
+        audioRef,
         error: undefined,
       });
     } catch (error: unknown) {
       updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
         status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async function handleLoadVoiceBlock(
+    messageId: string,
+    voiceBlockId: string,
+  ) {
+    if (!activeConversation) return;
+
+    const message = messages.find((item) => item.id === messageId);
+    const block = message?.content.find(
+      (item): item is VoiceBlock =>
+        item.type === "voice" && item.id === voiceBlockId,
+    );
+    if (!block?.audioRef) return;
+
+    if (!canUseSyncBlobStorage(syncSettings)) {
+      updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
+        status: "error",
+        error: "Configure sync to load this voice message.",
+      });
+      openSettings("sync");
+      return;
+    }
+
+    updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
+      status: "pending",
+      audioUrl: undefined,
+      error: undefined,
+    });
+
+    try {
+      const audioBlob = await pullSyncBlob(syncSettings, block.audioRef);
+      const audioUrl = URL.createObjectURL(audioBlob);
+      updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
+        status: "ready",
+        audioUrl,
+        audioRef: block.audioRef,
+        error: undefined,
+      });
+    } catch (error: unknown) {
+      updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
+        status: "error",
+        audioRef: block.audioRef,
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -3520,12 +3634,15 @@ export default function App() {
                 onSaveEdit={() => saveEditedMessage(m.id)}
                 onRegenerate={() => handleRegenerate(m.id)}
                 onContinue={handleContinue}
-                onSpeak={() => handleSpeakMessage(m)}
-                onGenerateVoiceBlock={(voiceBlockId) =>
-                  handleGenerateVoiceBlock(m.id, voiceBlockId)
-                }
-                onVoiceAutoPlayAttempted={consumeVoiceAutoplay}
-              />
+              onSpeak={() => handleSpeakMessage(m)}
+              onGenerateVoiceBlock={(voiceBlockId) =>
+                handleGenerateVoiceBlock(m.id, voiceBlockId)
+              }
+              onLoadVoiceBlock={(voiceBlockId) =>
+                handleLoadVoiceBlock(m.id, voiceBlockId)
+              }
+              onVoiceAutoPlayAttempted={consumeVoiceAutoplay}
+            />
             ))}
           </div>
         </main>
@@ -4466,11 +4583,13 @@ function VoiceMessageView({
   block,
   autoPlay = false,
   onGenerate,
+  onLoad,
   onAutoPlayAttempted,
 }: {
   block: VoiceBlock;
   autoPlay?: boolean;
   onGenerate?: (voiceBlockId: string) => void;
+  onLoad?: (voiceBlockId: string) => void;
   onAutoPlayAttempted?: (voiceBlockId: string) => void;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -4508,10 +4627,18 @@ function VoiceMessageView({
         {block.status !== "pending" && !block.audioUrl && (
           <button
             type="button"
-            onClick={() => onGenerate?.(block.id)}
+            onClick={() =>
+              block.audioRef ? onLoad?.(block.id) : onGenerate?.(block.id)
+            }
             className="cedar-voice-button"
           >
-            {block.status === "error" ? "重试" : "生成语音"}
+            {block.audioRef
+              ? block.status === "error"
+                ? "重新载入"
+                : "载入语音"
+              : block.status === "error"
+                ? "重试"
+                : "生成语音"}
           </button>
         )}
       </div>
@@ -4647,6 +4774,7 @@ interface MessageViewProps {
   onContinue: () => void;
   onSpeak: () => void;
   onGenerateVoiceBlock: (voiceBlockId: string) => void;
+  onLoadVoiceBlock: (voiceBlockId: string) => void;
   onVoiceAutoPlayAttempted: (voiceBlockId: string) => void;
 }
 
@@ -4670,6 +4798,7 @@ function MessageView({
   onContinue,
   onSpeak,
   onGenerateVoiceBlock,
+  onLoadVoiceBlock,
   onVoiceAutoPlayAttempted,
 }: MessageViewProps) {
   const isUser = message.role === "user";
@@ -4739,6 +4868,7 @@ function MessageView({
                   block={block}
                   autoPlay={autoPlayVoiceBlockIds.has(block.id)}
                   onGenerate={onGenerateVoiceBlock}
+                  onLoad={onLoadVoiceBlock}
                   onAutoPlayAttempted={onVoiceAutoPlayAttempted}
                 />
               ) : block.type === "tool" ? (

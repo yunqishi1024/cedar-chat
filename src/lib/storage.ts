@@ -453,7 +453,17 @@ function stripTransientContentBlocks(content: ContentBlock[]): ContentBlock[] {
         id: block.id,
         text: block.text,
         status: "error",
+        audioRef: block.audioRef,
         error: block.error,
+      };
+    }
+    if (block.audioRef) {
+      return {
+        type: "voice",
+        id: block.id,
+        text: block.text,
+        status: "ready",
+        audioRef: block.audioRef,
       };
     }
     if (isPersistentAudioUrl(block.audioUrl)) {
