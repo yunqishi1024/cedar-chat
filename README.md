@@ -56,5 +56,5 @@ code before upload:
 https://<your-worker>.workers.dev
 ```
 
-Use the same sync code on every device. Upload from the device with the newest
-data, then download on the other device.
+Use the same sync code on every device. Press Sync to merge the local browser
+snapshot with the cloud copy and upload the merged result back to R2.

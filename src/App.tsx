@@ -1270,6 +1270,196 @@ function currentFromSync(value: unknown): CurrentSelection {
   };
 }
 
+function snapshotTime(snapshot: CedarSyncSnapshot): number {
+  const time = Date.parse(snapshot.exportedAt);
+  return Number.isFinite(time) ? time : 0;
+}
+
+function newestSnapshot<T>(
+  localSnapshot: CedarSyncSnapshot,
+  cloudSnapshot: CedarSyncSnapshot,
+  localValue: T,
+  cloudValue: T,
+): T {
+  return snapshotTime(localSnapshot) >= snapshotTime(cloudSnapshot)
+    ? localValue
+    : cloudValue;
+}
+
+function mergeByIdNewest<T extends { id: string; updatedAt?: number }>(
+  localItems: T[],
+  cloudItems: T[],
+): T[] {
+  const merged = new Map<string, T>();
+  for (const item of cloudItems) merged.set(item.id, item);
+  for (const item of localItems) {
+    const existing = merged.get(item.id);
+    if (!existing || (item.updatedAt ?? 0) >= (existing.updatedAt ?? 0)) {
+      merged.set(item.id, item);
+    }
+  }
+  return [...merged.values()].sort(
+    (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+  );
+}
+
+function mergeByIdSnapshotNewest<T extends { id: string }>(
+  localSnapshot: CedarSyncSnapshot,
+  cloudSnapshot: CedarSyncSnapshot,
+  localItems: T[],
+  cloudItems: T[],
+): T[] {
+  const preferLocal = snapshotTime(localSnapshot) >= snapshotTime(cloudSnapshot);
+  const merged = new Map<string, T>();
+  for (const item of preferLocal ? cloudItems : localItems) {
+    merged.set(item.id, item);
+  }
+  for (const item of preferLocal ? localItems : cloudItems) {
+    merged.set(item.id, item);
+  }
+  return [...merged.values()];
+}
+
+function mergeMessages(
+  localMessages: StoredMessage[],
+  cloudMessages: StoredMessage[],
+  preferLocal: boolean,
+): StoredMessage[] {
+  const merged = new Map<string, StoredMessage>();
+  for (const message of preferLocal ? cloudMessages : localMessages) {
+    merged.set(message.id, message);
+  }
+  for (const message of preferLocal ? localMessages : cloudMessages) {
+    merged.set(message.id, message);
+  }
+  return [...merged.values()].sort(
+    (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0),
+  );
+}
+
+function mergeConversations(
+  localConversations: Conversation[],
+  cloudConversations: Conversation[],
+): Conversation[] {
+  const merged = new Map<string, Conversation>();
+  for (const conversation of cloudConversations) {
+    merged.set(conversation.id, conversation);
+  }
+  for (const conversation of localConversations) {
+    const existing = merged.get(conversation.id);
+    if (!existing) {
+      merged.set(conversation.id, conversation);
+      continue;
+    }
+
+    const preferLocal = conversation.updatedAt >= existing.updatedAt;
+    const base = preferLocal ? conversation : existing;
+    const other = preferLocal ? existing : conversation;
+    merged.set(conversation.id, {
+      ...base,
+      createdAt: Math.min(base.createdAt, other.createdAt),
+      updatedAt: Math.max(base.updatedAt, other.updatedAt),
+      messages: mergeMessages(conversation.messages, existing.messages, preferLocal),
+    });
+  }
+  return [...merged.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function mergeTtsSettings(
+  localSnapshot: CedarSyncSnapshot,
+  cloudSnapshot: CedarSyncSnapshot,
+): TtsSettings {
+  const local = ttsSettingsFromSync(localSnapshot.ttsSettings);
+  const cloud = ttsSettingsFromSync(cloudSnapshot.ttsSettings);
+  if (!local && !cloud) return { enabled: false, activeProfileId: null, profiles: [] };
+  if (!local) return cloud!;
+  if (!cloud) return local;
+
+  const profiles = mergeByIdSnapshotNewest(
+    localSnapshot,
+    cloudSnapshot,
+    local.profiles,
+    cloud.profiles,
+  );
+  const newest = newestSnapshot(localSnapshot, cloudSnapshot, local, cloud);
+  return {
+    enabled: newest.enabled,
+    activeProfileId: profiles.some((profile) => profile.id === newest.activeProfileId)
+      ? newest.activeProfileId
+      : (profiles[0]?.id ?? null),
+    profiles,
+  };
+}
+
+function mergeSyncSnapshots(
+  localSnapshot: CedarSyncSnapshot,
+  cloudSnapshot: CedarSyncSnapshot,
+): CedarSyncSnapshot {
+  const agents = mergeByIdNewest(
+    agentsFromImport(localSnapshot),
+    agentsFromImport(cloudSnapshot),
+  );
+  const fallbackAgentId =
+    localSnapshot.activeAgentId ??
+    cloudSnapshot.activeAgentId ??
+    agents[0]?.id ??
+    null;
+  const conversations = mergeConversations(
+    conversationsFromImport(localSnapshot),
+    conversationsFromImport(cloudSnapshot),
+  );
+  const activeAgentId = agents.some((agent) => agent.id === localSnapshot.activeAgentId)
+    ? localSnapshot.activeAgentId
+    : agents.some((agent) => agent.id === cloudSnapshot.activeAgentId)
+      ? cloudSnapshot.activeAgentId
+      : fallbackAgentId;
+  const activeConversationId = conversations.some(
+    (conversation) => conversation.id === localSnapshot.activeConversationId,
+  )
+    ? localSnapshot.activeConversationId
+    : conversations.some(
+          (conversation) => conversation.id === cloudSnapshot.activeConversationId,
+        )
+      ? cloudSnapshot.activeConversationId
+      : (conversations[0]?.id ?? null);
+
+  return {
+    app: "cedar-chat",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    ...(localSnapshot.deviceName ? { deviceName: localSnapshot.deviceName } : {}),
+    current: newestSnapshot(
+      localSnapshot,
+      cloudSnapshot,
+      currentFromSync(localSnapshot.current),
+      currentFromSync(cloudSnapshot.current),
+    ),
+    preferences: newestSnapshot(
+      localSnapshot,
+      cloudSnapshot,
+      preferencesFromSync(localSnapshot.preferences),
+      preferencesFromSync(cloudSnapshot.preferences),
+    ),
+    providers: mergeByIdSnapshotNewest(
+      localSnapshot,
+      cloudSnapshot,
+      providersFromSync(localSnapshot.providers),
+      providersFromSync(cloudSnapshot.providers),
+    ),
+    mcpServers: mergeByIdSnapshotNewest(
+      localSnapshot,
+      cloudSnapshot,
+      mcpServersFromSync(localSnapshot.mcpServers),
+      mcpServersFromSync(cloudSnapshot.mcpServers),
+    ),
+    ttsSettings: mergeTtsSettings(localSnapshot, cloudSnapshot),
+    agents,
+    activeAgentId,
+    conversations,
+    activeConversationId,
+  };
+}
+
 function normalizeConversationsForAgents(
   conversations: Conversation[],
   agents: Agent[],
@@ -2798,27 +2988,29 @@ export default function App() {
 
   async function handleSyncPull() {
     if (syncBusy) return;
-    if (
-      !confirm(
-        "Download the cloud copy and replace this browser's Cedar Chat data?",
-      )
-    ) {
-      return;
-    }
 
     setSyncBusy(true);
-    setSyncStatus("Downloading...");
+    setSyncStatus("Syncing...");
     try {
-      const snapshot = await pullSyncSnapshot(syncSettings);
-      if (!snapshot) {
-        setSyncStatus("No cloud copy found for this sync code.");
-        return;
-      }
+      const localSnapshot = createSyncSnapshot();
+      const cloudSnapshot = await pullSyncSnapshot(syncSettings);
+      const mergedSnapshot = cloudSnapshot
+        ? mergeSyncSnapshots(localSnapshot, cloudSnapshot)
+        : localSnapshot;
 
-      applySyncSnapshot(snapshot);
+      applySyncSnapshot(mergedSnapshot);
+      const result = await pushSyncSnapshot(syncSettings, mergedSnapshot);
       const now = Date.now();
-      setSyncSettings((previous) => ({ ...previous, lastPulledAt: now }));
-      setSyncStatus(`Downloaded ${snapshot.conversations.length} chats.`);
+      setSyncSettings((previous) => ({
+        ...previous,
+        lastPushedAt: now,
+        lastPulledAt: cloudSnapshot ? now : previous.lastPulledAt,
+      }));
+      setSyncStatus(
+        `Synced ${mergedSnapshot.conversations.length} chats${
+          result.bytes ? ` (${formatBytes(result.bytes)})` : ""
+        }.`,
+      );
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       setSyncStatus(message);

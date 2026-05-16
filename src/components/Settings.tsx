@@ -948,18 +948,18 @@ function SyncPanel({
 
         <div className="flex flex-wrap gap-2">
           <button
-            onClick={onPush}
+            onClick={onPull}
             disabled={busy || !canSync}
             className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
           >
-            Upload
+            Sync
           </button>
           <button
-            onClick={onPull}
+            onClick={onPush}
             disabled={busy || !canSync}
             className="rounded border border-neutral-300 px-4 py-2 text-sm hover:bg-neutral-50 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800"
           >
-            Download
+            Upload only
           </button>
         </div>
 
