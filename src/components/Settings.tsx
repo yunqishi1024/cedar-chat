@@ -12,6 +12,7 @@ import {
   newProviderId,
   type McpServerConfig,
   type Preferences,
+  type SyncSettings,
   type TtsProfile,
   type TtsProviderKind,
   type TtsSettings,
@@ -26,15 +27,21 @@ interface Props {
   preferences: Preferences;
   mcpServers: McpServerConfig[];
   ttsSettings: TtsSettings;
+  syncSettings: SyncSettings;
+  syncBusy: boolean;
+  syncStatus: string | null;
   onClose: () => void;
   onChange: (providers: ProviderConfig[]) => void;
   onActiveTabChange: (tab: SettingsTab) => void;
   onPreferencesChange: (prefs: Preferences) => void;
   onMcpServersChange: (servers: McpServerConfig[]) => void;
   onTtsSettingsChange: (settings: TtsSettings) => void;
+  onSyncSettingsChange: (settings: SyncSettings) => void;
+  onSyncPush: () => void;
+  onSyncPull: () => void;
 }
 
-export type SettingsTab = "providers" | "preferences" | "mcp" | "tts";
+export type SettingsTab = "providers" | "preferences" | "mcp" | "tts" | "sync";
 
 function emptyConfig(): ProviderConfig {
   return {
@@ -54,12 +61,18 @@ export function Settings({
   preferences,
   mcpServers,
   ttsSettings,
+  syncSettings,
+  syncBusy,
+  syncStatus,
   onClose,
   onChange,
   onActiveTabChange,
   onPreferencesChange,
   onMcpServersChange,
   onTtsSettingsChange,
+  onSyncSettingsChange,
+  onSyncPush,
+  onSyncPull,
 }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<ProviderConfig | null>(null);
@@ -156,6 +169,16 @@ export function Settings({
               语音
             </button>
             <button
+              onClick={() => onActiveTabChange("sync")}
+              className={`px-3 py-1 rounded text-sm ${
+                activeTab === "sync"
+                  ? "bg-neutral-100 dark:bg-neutral-800 font-medium"
+                  : "text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100"
+              }`}
+            >
+              同步
+            </button>
+            <button
               onClick={() => onActiveTabChange("mcp")}
               className={`px-3 py-1 rounded text-sm ${
                 activeTab === "mcp"
@@ -181,6 +204,15 @@ export function Settings({
           />
         ) : activeTab === "tts" ? (
           <TtsPanel settings={ttsSettings} onChange={onTtsSettingsChange} />
+        ) : activeTab === "sync" ? (
+          <SyncPanel
+            settings={syncSettings}
+            busy={syncBusy}
+            status={syncStatus}
+            onChange={onSyncSettingsChange}
+            onPush={onSyncPush}
+            onPull={onSyncPull}
+          />
         ) : activeTab === "mcp" ? (
           <McpPanel servers={mcpServers} onChange={onMcpServersChange} />
         ) : (
@@ -858,6 +890,96 @@ function TtsPanel({
       </section>
     </div>
   );
+}
+
+function SyncPanel({
+  settings,
+  busy,
+  status,
+  onChange,
+  onPush,
+  onPull,
+}: {
+  settings: SyncSettings;
+  busy: boolean;
+  status: string | null;
+  onChange: (settings: SyncSettings) => void;
+  onPush: () => void;
+  onPull: () => void;
+}) {
+  const canSync = settings.endpoint.trim() && settings.syncCode.trim().length >= 8;
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 sm:p-6">
+      <div className="max-w-xl space-y-5">
+        <Field label="Sync URL">
+          <input
+            className="input"
+            placeholder="https://mcp-gateway.yixinliu1024.workers.dev"
+            value={settings.endpoint}
+            onChange={(event) =>
+              onChange({ ...settings, endpoint: event.target.value })
+            }
+          />
+        </Field>
+
+        <Field label="Sync Code">
+          <input
+            className="input"
+            type="password"
+            placeholder="at least 8 characters"
+            value={settings.syncCode}
+            onChange={(event) =>
+              onChange({ ...settings, syncCode: event.target.value })
+            }
+          />
+        </Field>
+
+        <Field label="Device Name">
+          <input
+            className="input"
+            placeholder="MacBook, iPhone..."
+            value={settings.deviceName}
+            onChange={(event) =>
+              onChange({ ...settings, deviceName: event.target.value })
+            }
+          />
+        </Field>
+
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={onPush}
+            disabled={busy || !canSync}
+            className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            Upload
+          </button>
+          <button
+            onClick={onPull}
+            disabled={busy || !canSync}
+            className="rounded border border-neutral-300 px-4 py-2 text-sm hover:bg-neutral-50 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800"
+          >
+            Download
+          </button>
+        </div>
+
+        <div className="space-y-1 text-xs text-neutral-500">
+          <div>Last upload: {formatSyncTime(settings.lastPushedAt)}</div>
+          <div>Last download: {formatSyncTime(settings.lastPulledAt)}</div>
+        </div>
+
+        {status && (
+          <div className="rounded border border-neutral-200 p-3 text-sm dark:border-neutral-800">
+            {status}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function formatSyncTime(value: number | null): string {
+  return value ? new Date(value).toLocaleString() : "Never";
 }
 
 function PreferencesPanel({

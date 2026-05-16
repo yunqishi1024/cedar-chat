@@ -45,3 +45,16 @@ npm run preview
 
 For access outside your Wi-Fi, deploy the built app or expose it through a
 secure tunnel such as Cloudflare Tunnel or ngrok.
+
+## Cloud Sync
+
+Settings → 同步 can upload and download one Cedar Chat snapshot through the
+Cloudflare Worker sync endpoint. The browser encrypts the snapshot with the sync
+code before upload:
+
+```text
+https://<your-worker>.workers.dev
+```
+
+Use the same sync code on every device. Upload from the device with the newest
+data, then download on the other device.

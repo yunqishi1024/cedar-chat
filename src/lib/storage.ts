@@ -13,6 +13,7 @@ const AGENTS_KEY = "cedar-chat.agents";
 const ACTIVE_AGENT_KEY = "cedar-chat.activeAgent";
 const MCP_SERVERS_KEY = "cedar-chat.mcpServers";
 const TTS_SETTINGS_KEY = "cedar-chat.ttsSettings";
+const SYNC_SETTINGS_KEY = "cedar-chat.syncSettings";
 
 export interface CurrentSelection {
   providerId: string | null;
@@ -113,6 +114,14 @@ export interface McpServerConfig {
   enabled: boolean;
 }
 
+export interface SyncSettings {
+  endpoint: string;
+  syncCode: string;
+  deviceName: string;
+  lastPushedAt: number | null;
+  lastPulledAt: number | null;
+}
+
 const DEFAULT_PREFS: Preferences = {
   historyDepth: "all",
 };
@@ -133,6 +142,14 @@ const DEFAULT_TTS_SETTINGS: TtsSettings = {
   enabled: false,
   activeProfileId: null,
   profiles: [],
+};
+
+const DEFAULT_SYNC_SETTINGS: SyncSettings = {
+  endpoint: "",
+  syncCode: "",
+  deviceName: "",
+  lastPushedAt: null,
+  lastPulledAt: null,
 };
 
 export function loadPreferences(): Preferences {
@@ -161,6 +178,20 @@ export function loadTtsSettings(): TtsSettings {
 
 export function saveTtsSettings(settings: TtsSettings): void {
   safeSetLocalStorage(TTS_SETTINGS_KEY, JSON.stringify(settings));
+}
+
+export function loadSyncSettings(): SyncSettings {
+  try {
+    const raw = localStorage.getItem(SYNC_SETTINGS_KEY);
+    if (!raw) return DEFAULT_SYNC_SETTINGS;
+    return normalizeSyncSettings(JSON.parse(raw) as unknown);
+  } catch {
+    return DEFAULT_SYNC_SETTINGS;
+  }
+}
+
+export function saveSyncSettings(settings: SyncSettings): void {
+  safeSetLocalStorage(SYNC_SETTINGS_KEY, JSON.stringify(normalizeSyncSettings(settings)));
 }
 
 export function newTtsProfileId(): string {
@@ -251,6 +282,23 @@ function normalizeTtsProvider(value: unknown): TtsProviderKind {
     value === "edge"
     ? value
     : "edge";
+}
+
+function normalizeSyncSettings(value: unknown): SyncSettings {
+  if (!isRecord(value)) return DEFAULT_SYNC_SETTINGS;
+  return {
+    endpoint: stringValue(value.endpoint),
+    syncCode: stringValue(value.syncCode),
+    deviceName: stringValue(value.deviceName),
+    lastPushedAt:
+      typeof value.lastPushedAt === "number" && Number.isFinite(value.lastPushedAt)
+        ? value.lastPushedAt
+        : null,
+    lastPulledAt:
+      typeof value.lastPulledAt === "number" && Number.isFinite(value.lastPulledAt)
+        ? value.lastPulledAt
+        : null,
+  };
 }
 
 function stringValue(value: unknown): string {
@@ -399,18 +447,32 @@ function stripTransientConversationState(conversation: Conversation): Conversati
 function stripTransientContentBlocks(content: ContentBlock[]): ContentBlock[] {
   return content.map((block) => {
     if (block.type !== "voice") return block;
-    return block.status === "error"
-      ? {
-          type: "voice",
-          id: block.id,
-          text: block.text,
-          status: "error",
-          error: block.error,
-        }
-      : {
-          type: "voice",
-          id: block.id,
-          text: block.text,
-        };
+    if (block.status === "error") {
+      return {
+        type: "voice",
+        id: block.id,
+        text: block.text,
+        status: "error",
+        error: block.error,
+      };
+    }
+    if (isPersistentAudioUrl(block.audioUrl)) {
+      return {
+        type: "voice",
+        id: block.id,
+        text: block.text,
+        status: "ready",
+        audioUrl: block.audioUrl,
+      };
+    }
+    return {
+      type: "voice",
+      id: block.id,
+      text: block.text,
+    };
   });
+}
+
+function isPersistentAudioUrl(url: string | undefined): url is string {
+  return Boolean(url?.startsWith("data:audio/"));
 }

@@ -46,6 +46,8 @@ import {
   savePreferences,
   loadTtsSettings,
   saveTtsSettings,
+  loadSyncSettings,
+  saveSyncSettings,
   getActiveTtsProfile,
   loadMcpServers,
   saveMcpServers,
@@ -63,11 +65,13 @@ import {
   type ClaudePromptCacheMode,
   type ClaudePromptCacheTTL,
   type Conversation,
+  type CurrentSelection,
   type ThinkingEffort,
   type ThinkingMode,
   type McpServerConfig,
   type StoredMessage,
   type Preferences,
+  type SyncSettings,
   type TtsSettings,
 } from "./lib/storage";
 import {
@@ -75,6 +79,11 @@ import {
   listMcpServerTools,
   type McpToolSummary,
 } from "./lib/mcp";
+import {
+  pullSyncSnapshot,
+  pushSyncSnapshot,
+  type CedarSyncSnapshot,
+} from "./lib/sync";
 
 // ------------------------- Message type (UI-level) -------------------------
 
@@ -219,19 +228,29 @@ function normalizeGeneratedTitle(text: string): string {
 function stripTransientContentBlocks(content: ContentBlock[]): ContentBlock[] {
   return content.map((block) => {
     if (block.type !== "voice") return block;
-    return block.status === "error"
-      ? {
-          type: "voice",
-          id: block.id,
-          text: block.text,
-          status: "error",
-          error: block.error,
-        }
-      : {
-          type: "voice",
-          id: block.id,
-          text: block.text,
-        };
+    if (block.status === "error") {
+      return {
+        type: "voice",
+        id: block.id,
+        text: block.text,
+        status: "error",
+        error: block.error,
+      };
+    }
+    if (isPersistentAudioUrl(block.audioUrl)) {
+      return {
+        type: "voice",
+        id: block.id,
+        text: block.text,
+        status: "ready",
+        audioUrl: block.audioUrl,
+      };
+    }
+    return {
+      type: "voice",
+      id: block.id,
+      text: block.text,
+    };
   });
 }
 
@@ -267,6 +286,25 @@ function collectObjectAudioUrls(conversations: Conversation[]): Set<string> {
     }
   }
   return urls;
+}
+
+function isPersistentAudioUrl(url: string | undefined): url is string {
+  return Boolean(url?.startsWith("data:audio/"));
+}
+
+function audioBlobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("Could not read generated audio."));
+      }
+    };
+    reader.onerror = () => reject(new Error("Could not read generated audio."));
+    reader.readAsDataURL(blob);
+  });
 }
 
 function assistantMessagesFromContentSets(
@@ -1169,6 +1207,69 @@ function conversationsFromImport(value: unknown): Conversation[] {
   return [];
 }
 
+function providersFromSync(value: unknown): ProviderConfig[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is ProviderConfig => {
+    if (!isRecord(item)) return false;
+    return (
+      typeof item.id === "string" &&
+      typeof item.name === "string" &&
+      (item.kind === "openai-compatible" || item.kind === "anthropic") &&
+      typeof item.baseUrl === "string" &&
+      typeof item.apiKey === "string" &&
+      Array.isArray(item.models) &&
+      item.models.every((model) => typeof model === "string")
+    );
+  });
+}
+
+function mcpServersFromSync(value: unknown): McpServerConfig[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is McpServerConfig => {
+    if (!isRecord(item)) return false;
+    return (
+      typeof item.id === "string" &&
+      typeof item.name === "string" &&
+      typeof item.url === "string" &&
+      typeof item.bearerToken === "string" &&
+      typeof item.enabled === "boolean"
+    );
+  });
+}
+
+function preferencesFromSync(value: unknown): Preferences {
+  if (!isRecord(value)) return { historyDepth: "all" };
+  const historyDepth =
+    value.historyDepth === "all"
+      ? "all"
+      : typeof value.historyDepth === "number" && Number.isFinite(value.historyDepth)
+        ? Math.max(0, Math.min(300, Math.round(value.historyDepth)))
+        : "all";
+  return { historyDepth };
+}
+
+function ttsSettingsFromSync(value: unknown): TtsSettings | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.enabled !== "boolean") return null;
+  if (
+    value.activeProfileId !== null &&
+    value.activeProfileId !== undefined &&
+    typeof value.activeProfileId !== "string"
+  ) {
+    return null;
+  }
+  if (!Array.isArray(value.profiles)) return null;
+  return value as unknown as TtsSettings;
+}
+
+function currentFromSync(value: unknown): CurrentSelection {
+  if (!isRecord(value)) return { providerId: null, model: null };
+  return {
+    providerId: typeof value.providerId === "string" ? value.providerId : null,
+    model: typeof value.model === "string" ? value.model : null,
+  };
+}
+
 function normalizeConversationsForAgents(
   conversations: Conversation[],
   agents: Agent[],
@@ -1284,6 +1385,9 @@ export default function App() {
   const [ttsSettings, setTtsSettings] = useState<TtsSettings>(() =>
     loadTtsSettings(),
   );
+  const [syncSettings, setSyncSettings] = useState<SyncSettings>(() =>
+    loadSyncSettings(),
+  );
   const [mcpServers, setMcpServers] = useState<McpServerConfig[]>(() =>
     loadMcpServers(),
   );
@@ -1396,6 +1500,8 @@ export default function App() {
   const [agentsOpen, setAgentsOpen] = useState(false);
   const [windowSettingsOpen, setWindowSettingsOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<string | null>(null);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [autoPlayVoiceBlockIds, setAutoPlayVoiceBlockIds] = useState<
     ReadonlySet<string>
@@ -1481,6 +1587,10 @@ export default function App() {
   }, [ttsSettings]);
 
   useEffect(() => {
+    saveSyncSettings(syncSettings);
+  }, [syncSettings]);
+
+  useEffect(() => {
     saveMcpServers(mcpServers);
   }, [mcpServers]);
 
@@ -1534,7 +1644,7 @@ export default function App() {
           block.text,
           signal,
         );
-        const audioUrl = URL.createObjectURL(audioBlob);
+        const audioUrl = await audioBlobToDataUrl(audioBlob);
         updateVoiceBlock(conversationId, messageId, block.id, {
           status: "ready",
           audioUrl,
@@ -2220,6 +2330,45 @@ export default function App() {
     }
   }
 
+  async function handleGenerateVoiceBlock(
+    messageId: string,
+    voiceBlockId: string,
+  ) {
+    if (!activeConversation) return;
+    if (!ttsVoiceMessagesAvailable || !activeTtsProfile) {
+      openSettings("tts");
+      return;
+    }
+
+    const message = messages.find((item) => item.id === messageId);
+    const block = message?.content.find(
+      (item): item is VoiceBlock =>
+        item.type === "voice" && item.id === voiceBlockId,
+    );
+    if (!block) return;
+
+    updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
+      status: "pending",
+      audioUrl: undefined,
+      error: undefined,
+    });
+
+    try {
+      const audioBlob = await synthesizeSpeech(activeTtsProfile, block.text);
+      const audioUrl = await audioBlobToDataUrl(audioBlob);
+      updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
+        status: "ready",
+        audioUrl,
+        error: undefined,
+      });
+    } catch (error: unknown) {
+      updateVoiceBlock(activeConversation.id, messageId, voiceBlockId, {
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   async function handleRegenerate(messageId: string) {
     if (!activeConversation || !currentProvider || !selectedModel || busy) return;
     const index = messages.findIndex((m) => m.id === messageId);
@@ -2558,6 +2707,126 @@ export default function App() {
     }
   }
 
+  function createSyncSnapshot(): CedarSyncSnapshot {
+    const deviceName = syncSettings.deviceName.trim();
+    return {
+      app: "cedar-chat",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      ...(deviceName ? { deviceName } : {}),
+      current: {
+        providerId: activeProviderId ?? currentProviderId,
+        model: selectedModel ?? currentModel,
+      },
+      preferences,
+      providers,
+      mcpServers,
+      ttsSettings,
+      agents,
+      activeAgentId: activeAgent?.id ?? activeAgentId,
+      conversations: conversations.map(stripTransientConversation),
+      activeConversationId: activeConversation?.id ?? activeConversationId,
+    };
+  }
+
+  function applySyncSnapshot(snapshot: CedarSyncSnapshot) {
+    if (snapshot.app !== "cedar-chat" || snapshot.version !== 1) {
+      throw new Error("This is not a Cedar Chat sync snapshot.");
+    }
+
+    const nextProviders = providersFromSync(snapshot.providers);
+    const nextMcpServers = mcpServersFromSync(snapshot.mcpServers);
+    const nextTtsSettings = ttsSettingsFromSync(snapshot.ttsSettings);
+    const nextCurrent = currentFromSync(snapshot.current);
+    const nextAgents = agentsFromImport(snapshot);
+    const agentsToUse = nextAgents.length > 0 ? nextAgents : [createDefaultAgent()];
+    const agentIds = new Set(agentsToUse.map((agent) => agent.id));
+    const fallbackAgentId =
+      snapshot.activeAgentId && agentIds.has(snapshot.activeAgentId)
+        ? snapshot.activeAgentId
+        : (agentsToUse[0]?.id ?? null);
+    const nextConversations = normalizeConversationsForAgents(
+      conversationsFromImport(snapshot),
+      agentsToUse,
+      fallbackAgentId,
+      DEFAULT_LEGACY_CLAUDE_PROMPT_CACHE,
+    );
+    const conversationsToUse =
+      nextConversations.length > 0
+        ? nextConversations
+        : [createEmptyConversation(fallbackAgentId)];
+    const activeConversationIdToUse =
+      snapshot.activeConversationId &&
+      conversationsToUse.some(
+        (conversation) => conversation.id === snapshot.activeConversationId,
+      )
+        ? snapshot.activeConversationId
+        : (conversationsToUse[0]?.id ?? null);
+
+    setProviders(nextProviders);
+    setPreferences(preferencesFromSync(snapshot.preferences));
+    setMcpServers(nextMcpServers);
+    if (nextTtsSettings) setTtsSettings(nextTtsSettings);
+    setCurrentProviderId(nextCurrent.providerId);
+    setCurrentModel(nextCurrent.model);
+    setChatState({
+      agents: agentsToUse,
+      activeAgentId: fallbackAgentId,
+      conversations: conversationsToUse,
+      activeConversationId: activeConversationIdToUse,
+    });
+  }
+
+  async function handleSyncPush() {
+    if (syncBusy) return;
+    setSyncBusy(true);
+    setSyncStatus("Uploading...");
+    try {
+      const result = await pushSyncSnapshot(syncSettings, createSyncSnapshot());
+      const now = Date.now();
+      setSyncSettings((previous) => ({ ...previous, lastPushedAt: now }));
+      setSyncStatus(
+        `Uploaded${result.bytes ? ` ${formatBytes(result.bytes)}` : ""}.`,
+      );
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSyncStatus(message);
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function handleSyncPull() {
+    if (syncBusy) return;
+    if (
+      !confirm(
+        "Download the cloud copy and replace this browser's Cedar Chat data?",
+      )
+    ) {
+      return;
+    }
+
+    setSyncBusy(true);
+    setSyncStatus("Downloading...");
+    try {
+      const snapshot = await pullSyncSnapshot(syncSettings);
+      if (!snapshot) {
+        setSyncStatus("No cloud copy found for this sync code.");
+        return;
+      }
+
+      applySyncSnapshot(snapshot);
+      const now = Date.now();
+      setSyncSettings((previous) => ({ ...previous, lastPulledAt: now }));
+      setSyncStatus(`Downloaded ${snapshot.conversations.length} chats.`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSyncStatus(message);
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
   function handleAgentsChange(nextAgents: Agent[]) {
     if (nextAgents.length === 0) return;
 
@@ -2806,6 +3075,9 @@ export default function App() {
               onRegenerate={() => handleRegenerate(m.id)}
               onContinue={handleContinue}
               onSpeak={() => handleSpeakMessage(m)}
+              onGenerateVoiceBlock={(voiceBlockId) =>
+                handleGenerateVoiceBlock(m.id, voiceBlockId)
+              }
               onVoiceAutoPlayAttempted={consumeVoiceAutoplay}
             />
           ))}
@@ -2890,12 +3162,18 @@ export default function App() {
         preferences={preferences}
         mcpServers={mcpServers}
         ttsSettings={ttsSettings}
+        syncSettings={syncSettings}
+        syncBusy={syncBusy}
+        syncStatus={syncStatus}
         onClose={() => setSettingsOpen(false)}
         onChange={setProviders}
         onActiveTabChange={setSettingsTab}
         onPreferencesChange={setPreferences}
         onMcpServersChange={setMcpServers}
         onTtsSettingsChange={setTtsSettings}
+        onSyncSettingsChange={setSyncSettings}
+        onSyncPush={handleSyncPush}
+        onSyncPull={handleSyncPull}
       />
       <ExportDialog
         open={exportOpen}
@@ -3690,10 +3968,12 @@ function AttachmentPreview({
 function VoiceMessageView({
   block,
   autoPlay = false,
+  onGenerate,
   onAutoPlayAttempted,
 }: {
   block: VoiceBlock;
   autoPlay?: boolean;
+  onGenerate?: (voiceBlockId: string) => void;
   onAutoPlayAttempted?: (voiceBlockId: string) => void;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -3727,6 +4007,15 @@ function VoiceMessageView({
           <span className="text-xs text-neutral-500 dark:text-neutral-400">
             生成中...
           </span>
+        )}
+        {block.status !== "pending" && !block.audioUrl && (
+          <button
+            type="button"
+            onClick={() => onGenerate?.(block.id)}
+            className="rounded px-2 py-1 text-xs text-blue-700 hover:bg-blue-100 dark:text-blue-200 dark:hover:bg-blue-900"
+          >
+            {block.status === "error" ? "重试" : "生成语音"}
+          </button>
         )}
       </div>
       {block.audioUrl && (
@@ -3859,6 +4148,7 @@ interface MessageViewProps {
   onRegenerate: () => void;
   onContinue: () => void;
   onSpeak: () => void;
+  onGenerateVoiceBlock: (voiceBlockId: string) => void;
   onVoiceAutoPlayAttempted: (voiceBlockId: string) => void;
 }
 
@@ -3880,6 +4170,7 @@ function MessageView({
   onRegenerate,
   onContinue,
   onSpeak,
+  onGenerateVoiceBlock,
   onVoiceAutoPlayAttempted,
 }: MessageViewProps) {
   const isUser = message.role === "user";
@@ -3942,6 +4233,7 @@ function MessageView({
                   key={block.id}
                   block={block}
                   autoPlay={autoPlayVoiceBlockIds.has(block.id)}
+                  onGenerate={onGenerateVoiceBlock}
                   onAutoPlayAttempted={onVoiceAutoPlayAttempted}
                 />
               ) : block.type === "tool" ? (
