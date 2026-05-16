@@ -131,6 +131,8 @@ const DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS = 160;
 const MAX_MCP_TOOL_ROUNDS = 6;
 const MAX_MCP_RESULT_CHARS = 120_000;
 const MAX_TOOL_BLOCK_CHARS = 4_000;
+const WEATHER_LOCATION = "Beijing";
+const WEATHER_FALLBACK_LABEL = "多云";
 
 type WindowSettingsPatch = Partial<
   Pick<
@@ -792,6 +794,190 @@ function formatMessageTimestamp(timestamp: number | undefined): string {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+function formatBeijingClock(now = new Date()): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(now);
+}
+
+function weatherToolScore(server: McpServerConfig, tool: McpToolSummary): number {
+  const haystack = [
+    server.name,
+    server.url,
+    tool.name,
+    tool.description ?? "",
+  ]
+    .join(" ")
+    .toLowerCase();
+  let score = 0;
+  if (haystack.includes("weather") || haystack.includes("天气")) score += 4;
+  if (haystack.includes("forecast") || haystack.includes("预报")) score += 2;
+  if (haystack.includes("current")) score += 1;
+  return score;
+}
+
+function firstRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
+function buildWeatherArgs(tool: McpToolSummary): Record<string, unknown> | null {
+  const schema = firstRecord(tool.inputSchema);
+  const properties = firstRecord(schema.properties);
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((item): item is string => typeof item === "string")
+    : [];
+  const propertyNames = Object.keys(properties);
+  const args: Record<string, unknown> = {};
+  const locationKeys = [
+    "location",
+    "city",
+    "place",
+    "query",
+    "q",
+    "address",
+  ];
+  const locationKey =
+    propertyNames.find((name) => locationKeys.includes(name.toLowerCase())) ??
+    required.find((name) => locationKeys.includes(name.toLowerCase()));
+
+  if (locationKey) {
+    args[locationKey] = WEATHER_LOCATION;
+  } else {
+    const stringKeys = propertyNames.filter((name) => {
+      const property = firstRecord(properties[name]);
+      return property.type === "string";
+    });
+    if (stringKeys.length === 1) {
+      args[stringKeys[0]] = WEATHER_LOCATION;
+    } else if (required.length === 0 && propertyNames.length === 0) {
+      return {};
+    }
+  }
+
+  const missingRequired = required.filter((name) => !(name in args));
+  return missingRequired.length === 0 ? args : null;
+}
+
+function weatherTextFromUnknown(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(weatherTextFromUnknown).join(" ");
+  if (!isRecord(value)) return "";
+  const preferredKeys = [
+    "condition",
+    "weather",
+    "summary",
+    "description",
+    "text",
+    "status",
+  ];
+  const preferred = preferredKeys
+    .map((key) => weatherTextFromUnknown(value[key]))
+    .filter(Boolean)
+    .join(" ");
+  return preferred || Object.values(value).map(weatherTextFromUnknown).join(" ");
+}
+
+function weatherLabelFromText(text: string): string | null {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) return null;
+
+  const chineseMatch = compact.match(
+    /(晴|多云|阴|小雨|中雨|大雨|阵雨|雷雨|暴雨|小雪|中雪|大雪|雨夹雪|雾|霾)/,
+  );
+  if (chineseMatch) return chineseMatch[1];
+
+  const lower = compact.toLowerCase();
+  if (lower.includes("thunder")) return "雷雨";
+  if (lower.includes("snow")) return "小雪";
+  if (lower.includes("rain") || lower.includes("shower")) return "小雨";
+  if (lower.includes("overcast")) return "阴";
+  if (lower.includes("cloud")) return "多云";
+  if (lower.includes("fog") || lower.includes("mist")) return "雾";
+  if (lower.includes("clear") || lower.includes("sunny")) return "晴";
+
+  return null;
+}
+
+function weatherLabelFromMcpResult(result: unknown): string | null {
+  const root = firstRecord(result);
+  const structured = weatherLabelFromText(
+    weatherTextFromUnknown(root.structuredContent),
+  );
+  if (structured) return structured;
+
+  const content = root.content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((item) => {
+        const record = firstRecord(item);
+        return typeof record.text === "string" ? record.text : weatherTextFromUnknown(item);
+      })
+      .join(" ");
+    return weatherLabelFromText(text);
+  }
+
+  return weatherLabelFromText(weatherTextFromUnknown(result));
+}
+
+async function fetchWeatherLabelFromMcp(
+  servers: McpServerConfig[],
+): Promise<string | null> {
+  const enabledServers = servers.filter(
+    (server) => server.enabled && server.url.trim(),
+  );
+  if (enabledServers.length === 0) return null;
+
+  const candidates: Array<{
+    server: McpServerConfig;
+    sessionId?: string;
+    tool: McpToolSummary;
+    score: number;
+  }> = [];
+
+  for (const server of enabledServers) {
+    try {
+      const result = await listMcpServerTools(server);
+      for (const tool of result.tools) {
+        const score = weatherToolScore(server, tool);
+        if (score > 0) {
+          candidates.push({
+            server,
+            sessionId: result.sessionId,
+            tool,
+            score,
+          });
+        }
+      }
+    } catch {
+      // Weather is decorative here; failed MCP servers should not disturb chat.
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+
+  for (const candidate of candidates) {
+    const args = buildWeatherArgs(candidate.tool);
+    if (!args) continue;
+    try {
+      const result = await callMcpTool(
+        candidate.server,
+        candidate.tool.name,
+        args,
+        candidate.sessionId,
+      );
+      const label = weatherLabelFromMcpResult(result.result);
+      if (label) return label;
+    } catch {
+      // Try the next weather-looking tool.
+    }
+  }
+
+  return null;
 }
 
 function currentTimePromptContent(now = new Date()): ChatTextContentPart {
@@ -1687,6 +1873,10 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exportSelectedIds, setExportSelectedIds] = useState<string[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [contextOpen, setContextOpen] = useState(false);
+  const [beijingTime, setBeijingTime] = useState(() => formatBeijingClock());
+  const [weatherLabel, setWeatherLabel] = useState(WEATHER_FALLBACK_LABEL);
   const [agentsOpen, setAgentsOpen] = useState(false);
   const [windowSettingsOpen, setWindowSettingsOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -1752,6 +1942,18 @@ export default function App() {
     () => messages.findLast((m) => m.role === "assistant")?.id ?? null,
     [messages],
   );
+  const contextSections = useMemo(
+    () => agentSections(activeConversationAgent),
+    [activeConversationAgent],
+  );
+  const lastUsage = useMemo(
+    () => messages.findLast((message) => message.usage)?.usage,
+    [messages],
+  );
+  const enabledMcpServers = useMemo(
+    () => mcpServers.filter((server) => server.enabled),
+    [mcpServers],
+  );
   const canSend = Boolean(
     currentProvider &&
       selectedModel &&
@@ -1795,6 +1997,30 @@ export default function App() {
   useEffect(() => {
     saveConversations(conversations);
   }, [conversations]);
+
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => setBeijingTime(formatBeijingClock()),
+      30_000,
+    );
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function refreshWeather() {
+      const label = await fetchWeatherLabelFromMcp(mcpServers);
+      if (!cancelled && label) setWeatherLabel(label);
+    }
+
+    void refreshWeather();
+    const timer = window.setInterval(() => void refreshWeather(), 30 * 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [mcpServers]);
 
   useEffect(() => {
     const nextUrls = collectObjectAudioUrls(conversations);
@@ -2919,6 +3145,10 @@ export default function App() {
     };
   }
 
+  function formatSyncSnapshotContents(snapshot: CedarSyncSnapshot): string {
+    return `${snapshot.conversations.length} chats, ${snapshot.mcpServers.length} MCP servers`;
+  }
+
   function applySyncSnapshot(snapshot: CedarSyncSnapshot) {
     if (snapshot.app !== "cedar-chat" || snapshot.version !== 1) {
       throw new Error("This is not a Cedar Chat sync snapshot.");
@@ -2972,11 +3202,14 @@ export default function App() {
     setSyncBusy(true);
     setSyncStatus("Uploading...");
     try {
-      const result = await pushSyncSnapshot(syncSettings, createSyncSnapshot());
+      const snapshot = createSyncSnapshot();
+      const result = await pushSyncSnapshot(syncSettings, snapshot);
       const now = Date.now();
       setSyncSettings((previous) => ({ ...previous, lastPushedAt: now }));
       setSyncStatus(
-        `Uploaded${result.bytes ? ` ${formatBytes(result.bytes)}` : ""}.`,
+        `Uploaded ${formatSyncSnapshotContents(snapshot)}${
+          result.bytes ? ` (${formatBytes(result.bytes)})` : ""
+        }.`,
       );
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -3007,7 +3240,7 @@ export default function App() {
         lastPulledAt: cloudSnapshot ? now : previous.lastPulledAt,
       }));
       setSyncStatus(
-        `Synced ${mergedSnapshot.conversations.length} chats${
+        `Synced ${formatSyncSnapshotContents(mergedSnapshot)}${
           result.bytes ? ` (${formatBytes(result.bytes)})` : ""
         }.`,
       );
@@ -3057,35 +3290,36 @@ export default function App() {
   // --- Render ---
 
   return (
-    <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+    <div className="cedar-app">
       {sidebarOpen && (
         <button
           type="button"
-          className="fixed inset-0 z-40 bg-black/40 md:hidden"
+          className="cedar-mobile-shade"
           aria-label="Close chats"
           onClick={() => setSidebarOpen(false)}
         />
       )}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 flex w-80 max-w-[85vw] shrink-0 flex-col border-r border-neutral-200 bg-white transition-transform duration-200 dark:border-neutral-800 dark:bg-neutral-900 md:static md:z-auto md:w-72 md:max-w-none md:translate-x-0 ${
-          sidebarOpen ? "translate-x-0" : "-translate-x-full"
-        }`}
+        className={`cedar-sidebar ${
+          sidebarCollapsed ? "cedar-sidebar-collapsed" : ""
+        } ${sidebarOpen ? "cedar-sidebar-open" : ""}`}
       >
-        <div className="space-y-2 p-3 border-b border-neutral-200 dark:border-neutral-800">
-          <div className="flex items-center justify-between md:hidden">
+        <div className="cedar-sidebar-head">
+          <div className="cedar-mobile-title">
             <div className="font-semibold">Cedar Chat</div>
             <button
               onClick={() => setSidebarOpen(false)}
-              className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+              className="cedar-ghost-button"
             >
               Close
             </button>
           </div>
-          <div className="flex gap-2">
+          <div className="cedar-agent-row">
             <select
-              className="select min-w-0 flex-1"
+              className="select cedar-agent-select"
               value={activeAgent?.id ?? ""}
               onChange={(event) => selectAgent(event.target.value)}
+              aria-label="Active agent"
             >
               {agents.map((agent) => (
                 <option key={agent.id} value={agent.id}>
@@ -3095,27 +3329,37 @@ export default function App() {
             </select>
             <button
               onClick={() => setAgentsOpen(true)}
-              className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+              className="cedar-icon-button"
               title="Manage agents"
             >
-              Agents
+              <span className="cedar-sidebar-label">Agents</span>
+              <span className="cedar-sidebar-icon">A</span>
             </button>
           </div>
-          <button
-            onClick={handleNewConversation}
-            className="w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
-          >
-            + New chat
-          </button>
+          <div className="cedar-sidebar-actions">
+            <button onClick={handleNewConversation} className="cedar-button">
+              <span className="cedar-button-mark">+</span>
+              <span className="cedar-sidebar-label">New chat</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSidebarCollapsed((value) => !value)}
+              className="cedar-icon-button cedar-collapse-button"
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              {sidebarCollapsed ? ">" : "<"}
+            </button>
+          </div>
         </div>
-        <nav className="flex-1 overflow-y-auto p-2 space-y-1">
+        <nav className="cedar-chat-list">
           {agentConversations.map((conversation) => (
             <div
               key={conversation.id}
-              className={`group flex items-center gap-1 rounded ${
+              className={`cedar-chat-row ${
                 conversation.id === activeConversation?.id
-                  ? "bg-neutral-100 dark:bg-neutral-800"
-                  : "hover:bg-neutral-50 dark:hover:bg-neutral-800/60"
+                  ? "cedar-chat-row-active"
+                  : ""
               }`}
             >
               <button
@@ -3123,37 +3367,43 @@ export default function App() {
                   setActiveConversationId(conversation.id);
                   setSidebarOpen(false);
                 }}
-                className="min-w-0 flex-1 text-left px-2 py-2"
+                className="cedar-chat-select"
+                title={conversation.title}
               >
-                <div className="truncate text-sm font-medium">
-                  {conversation.title}
-                </div>
-                <div className="text-xs text-neutral-500">
-                  {conversation.messages.length} messages
-                </div>
+                <span className="cedar-chat-initial">
+                  {conversation.title.trim().slice(0, 1).toUpperCase() || "C"}
+                </span>
+                <span className="cedar-chat-copy">
+                  <span className="cedar-chat-title">{conversation.title}</span>
+                  <span className="cedar-chat-count">
+                    {conversation.messages.length} messages
+                  </span>
+                </span>
               </button>
               <button
                 onClick={() => handleDeleteConversation(conversation.id)}
-                className="mr-1 rounded px-2 py-1 text-neutral-400 hover:bg-red-50 hover:text-red-600 md:opacity-0 md:group-hover:opacity-100 dark:hover:bg-red-950"
+                className="cedar-delete-button"
                 title="Delete chat"
               >
-                ×
+                x
               </button>
             </div>
           ))}
         </nav>
-        <div className="border-t border-neutral-200 dark:border-neutral-800 p-3 space-y-2">
-          <button
-            onClick={handleOpenExport}
-            className="w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
-          >
-            Export chats
+        <div className="cedar-sidebar-footer">
+          <div className="cedar-local-line">
+            <span className="cedar-sidebar-label">
+              Beijing · {beijingTime} · {weatherLabel}
+            </span>
+            <span className="cedar-sidebar-icon">BJ</span>
+          </div>
+          <button onClick={handleOpenExport} className="cedar-button cedar-button-muted">
+            <span className="cedar-sidebar-label">Export chats</span>
+            <span className="cedar-sidebar-icon">Ex</span>
           </button>
-          <button
-            onClick={handleImportClick}
-            className="w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
-          >
-            Import chats
+          <button onClick={handleImportClick} className="cedar-button cedar-button-muted">
+            <span className="cedar-sidebar-label">Import chats</span>
+            <span className="cedar-sidebar-icon">Im</span>
           </button>
           <input
             ref={importInputRef}
@@ -3166,185 +3416,241 @@ export default function App() {
       </aside>
 
       <div
-        className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+        className="cedar-workspace"
         onDragEnter={handleChatDragEnter}
         onDragOver={handleChatDragOver}
         onDragLeave={handleChatDragLeave}
         onDrop={handleChatDrop}
       >
-      {dragDepth > 0 && (
-        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-blue-50/80 backdrop-blur-sm dark:bg-blue-950/70">
-          <div className="rounded border-2 border-dashed border-blue-400 bg-white px-6 py-4 text-center shadow-lg dark:bg-neutral-900">
-            <div className="text-sm font-medium text-blue-700 dark:text-blue-300">
-              Drop files to attach
-            </div>
-            <div className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-              Images, text, PDF, Python, notebooks and common documents
+        {dragDepth > 0 && (
+          <div className="cedar-drop-overlay">
+            <div className="cedar-drop-card">
+              <div className="text-sm font-medium">Drop files to attach</div>
+              <div className="mt-1 text-xs text-[var(--text-tertiary)]">
+                Images, text, PDF, Python, notebooks and common documents
+              </div>
             </div>
           </div>
-        </div>
-      )}
-      {/* 顶部栏 */}
-      <header className="flex items-center gap-2 border-b border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900 sm:gap-3 sm:px-4">
-        <button
-          onClick={() => setSidebarOpen(true)}
-          className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800 md:hidden"
-          aria-label="Open chats"
-        >
-          ☰
-        </button>
-        <h1 className="hidden text-base font-semibold sm:block md:text-lg">🌲 Cedar Chat</h1>
-
-        <div className="min-w-0 flex-1 text-xs text-neutral-500 dark:text-neutral-400 sm:text-sm">
-          {currentProvider && selectedModel ? (
-            <span className="block truncate">
-              {currentProvider.name} · {selectedModel}
-            </span>
-          ) : (
-            <span>No model selected</span>
-          )}
-        </div>
-
-        <div className="flex shrink-0 gap-1 sm:gap-2">
+        )}
+        <header className="cedar-topbar">
           <button
-            onClick={() => setWindowSettingsOpen(true)}
-            disabled={!activeConversation}
-            className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800 sm:px-3"
+            onClick={() => setSidebarOpen(true)}
+            className="cedar-icon-button cedar-mobile-menu"
+            aria-label="Open chats"
           >
-            <span className="hidden sm:inline">窗口设置</span>
-            <span className="sm:hidden">窗口</span>
+            =
           </button>
-          <button
-            onClick={() => openSettings("providers")}
-            className="rounded border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800 sm:px-3"
-          >
-            <span className="hidden sm:inline">⚙ Providers</span>
-            <span className="sm:hidden">⚙</span>
-          </button>
-        </div>
-      </header>
+          <h1>Cedar Chat</h1>
 
-      {/* 消息列表 */}
-      <main className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-4 sm:py-6">
-        <div className="max-w-3xl mx-auto space-y-4">
-          {messages.length === 0 && (
-            <div className="text-center text-neutral-500 py-16">
-              {providers.length === 0 ? (
-                <>
-                  No provider configured yet.
-                  <br />
-                  Click{" "}
-                  <button
-                    onClick={() => openSettings("providers")}
-                    className="underline text-blue-600 dark:text-blue-400"
-                  >
-                    ⚙ Providers
-                  </button>{" "}
-                  to add one.
-                </>
-              ) : (
-                <>Pick a provider and model, then say hi.</>
-              )}
-            </div>
-          )}
-          {messages.map((m) => (
-            <MessageView
-              key={m.id}
-              message={m}
-              busy={busy}
-              canChat={Boolean(currentProvider && selectedModel)}
-              showTimestamp={activeConversation?.showMessageTimestamps ?? false}
-              isEditing={editingMessageId === m.id}
-              editingText={editingText}
-              isLastAssistant={m.id === lastAssistantId}
-              canSpeak={m.role === "assistant"}
-              speaking={speakingMessageId === m.id}
-              autoPlayVoiceBlockIds={autoPlayVoiceBlockIds}
-              onEditingTextChange={setEditingText}
-              onStartEdit={() => startEditing(m)}
-              onCancelEdit={cancelEditing}
-              onSaveEdit={() => saveEditedMessage(m.id)}
-              onRegenerate={() => handleRegenerate(m.id)}
-              onContinue={handleContinue}
-              onSpeak={() => handleSpeakMessage(m)}
-              onGenerateVoiceBlock={(voiceBlockId) =>
-                handleGenerateVoiceBlock(m.id, voiceBlockId)
-              }
-              onVoiceAutoPlayAttempted={consumeVoiceAutoplay}
-            />
-          ))}
-        </div>
-      </main>
-
-      {/* 输入框 */}
-      <footer className="border-t border-neutral-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-900 sm:p-4">
-        <div className="max-w-3xl mx-auto space-y-2">
-          {pendingAttachments.length > 0 && (
-            <div className="flex flex-wrap gap-2">
-              {pendingAttachments.map((attachment) => (
-                <AttachmentChip
-                  key={attachment.id}
-                  attachment={attachment}
-                  onRemove={() => removePendingAttachment(attachment.id)}
-                />
-              ))}
-            </div>
-          )}
-          {attachmentError && (
-            <div className="whitespace-pre-wrap rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
-              {attachmentError}
-            </div>
-          )}
-          <div className="flex gap-2">
-            <button
-              onClick={handleAttachmentClick}
-              disabled={!currentProvider || !selectedModel || attaching || busy}
-              className="rounded border border-neutral-300 px-3 py-2 text-sm hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800"
-              title="Attach files"
-            >
-              {attaching ? "..." : "+"}
-            </button>
-            <input
-              ref={attachmentInputRef}
-              type="file"
-              multiple
-              accept="image/*,.txt,.md,.markdown,.pdf,.py,.ipynb,.json,.csv,.ts,.tsx,.js,.jsx,.html,.css,.xml,.yaml,.yml"
-              className="hidden"
-              onChange={(event) => handleAttachmentFiles(event.target.files)}
-            />
-            <textarea
-              ref={chatInputRef}
-              className="flex-1 input resize-none"
-              rows={2}
-              placeholder={
-                currentProvider && selectedModel
-                  ? "Type a message... (Enter for newline, click Send to send)"
-                  : "Configure a provider first"
-              }
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onPaste={handleChatPaste}
-              disabled={!currentProvider || !selectedModel}
-            />
-            {busy ? (
-              <button
-                onClick={handleStop}
-                className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 text-sm"
-              >
-                Stop
-              </button>
+          <div className="cedar-model-line">
+            {currentProvider && selectedModel ? (
+              <span>
+                {currentProvider.name} · {selectedModel}
+              </span>
             ) : (
-              <button
-                onClick={handleSend}
-                disabled={!canSend}
-                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-              >
-                Send
-              </button>
+              <span>No model selected</span>
             )}
           </div>
+
+          <div className="cedar-top-actions">
+            <button
+              type="button"
+              onClick={() => setContextOpen((value) => !value)}
+              className="cedar-icon-button"
+              aria-label="Toggle context drawer"
+              title="Context"
+            >
+              🐱
+            </button>
+            <button
+              onClick={() => setWindowSettingsOpen(true)}
+              disabled={!activeConversation}
+              className="cedar-ghost-button"
+            >
+              <span className="hidden sm:inline">窗口设置</span>
+              <span className="sm:hidden">窗口</span>
+            </button>
+            <button
+              onClick={() => openSettings("providers")}
+              className="cedar-ghost-button"
+            >
+              <span className="hidden sm:inline">Providers</span>
+              <span className="sm:hidden">P</span>
+            </button>
+          </div>
+        </header>
+
+        <main className="cedar-conversation">
+          <div className="cedar-thread">
+            {messages.length === 0 && (
+              <div className="cedar-empty-state">
+                {providers.length === 0 ? (
+                  <>
+                    No provider configured yet.
+                    <br />
+                    <button
+                      onClick={() => openSettings("providers")}
+                      className="cedar-inline-link"
+                    >
+                      Open Providers
+                    </button>
+                  </>
+                ) : (
+                  <>Pick a provider and model, then say hi.</>
+                )}
+              </div>
+            )}
+            {messages.map((m) => (
+              <MessageView
+                key={m.id}
+                message={m}
+                busy={busy}
+                canChat={Boolean(currentProvider && selectedModel)}
+                assistantName={activeConversationAgent?.name ?? "Cedar"}
+                modelName={m.role === "assistant" ? selectedModel : null}
+                isEditing={editingMessageId === m.id}
+                editingText={editingText}
+                isLastAssistant={m.id === lastAssistantId}
+                canSpeak={m.role === "assistant"}
+                speaking={speakingMessageId === m.id}
+                autoPlayVoiceBlockIds={autoPlayVoiceBlockIds}
+                onEditingTextChange={setEditingText}
+                onStartEdit={() => startEditing(m)}
+                onCancelEdit={cancelEditing}
+                onSaveEdit={() => saveEditedMessage(m.id)}
+                onRegenerate={() => handleRegenerate(m.id)}
+                onContinue={handleContinue}
+                onSpeak={() => handleSpeakMessage(m)}
+                onGenerateVoiceBlock={(voiceBlockId) =>
+                  handleGenerateVoiceBlock(m.id, voiceBlockId)
+                }
+                onVoiceAutoPlayAttempted={consumeVoiceAutoplay}
+              />
+            ))}
+          </div>
+        </main>
+
+        <footer className="cedar-composer-shell">
+          <div className="cedar-composer">
+            {pendingAttachments.length > 0 && (
+              <div className="cedar-attachment-row">
+                {pendingAttachments.map((attachment) => (
+                  <AttachmentChip
+                    key={attachment.id}
+                    attachment={attachment}
+                    onRemove={() => removePendingAttachment(attachment.id)}
+                  />
+                ))}
+              </div>
+            )}
+            {attachmentError && (
+              <div className="cedar-alert">{attachmentError}</div>
+            )}
+            <div className="cedar-input-area">
+              <button
+                onClick={handleAttachmentClick}
+                disabled={!currentProvider || !selectedModel || attaching || busy}
+                className="cedar-tool-button"
+                title="Attach files"
+              >
+                {attaching ? "..." : "+"}
+              </button>
+              <input
+                ref={attachmentInputRef}
+                type="file"
+                multiple
+                accept="image/*,.txt,.md,.markdown,.pdf,.py,.ipynb,.json,.csv,.ts,.tsx,.js,.jsx,.html,.css,.xml,.yaml,.yml"
+                className="hidden"
+                onChange={(event) => handleAttachmentFiles(event.target.files)}
+              />
+              <textarea
+                ref={chatInputRef}
+                className="input cedar-chat-input"
+                rows={2}
+                placeholder={
+                  currentProvider && selectedModel
+                    ? "Say it quietly..."
+                    : "Configure a provider first"
+                }
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onPaste={handleChatPaste}
+                disabled={!currentProvider || !selectedModel}
+              />
+              {busy ? (
+                <button onClick={handleStop} className="cedar-stop-button">
+                  Stop
+                </button>
+              ) : (
+                <button
+                  onClick={handleSend}
+                  disabled={!canSend}
+                  className="cedar-send-button cedar-paw-send"
+                  aria-label="Send message"
+                  title="Send message"
+                >
+                  <span className="cedar-paw-print" aria-hidden="true">
+                    <span className="cedar-paw-toe cedar-paw-toe-1" />
+                    <span className="cedar-paw-toe cedar-paw-toe-2" />
+                    <span className="cedar-paw-toe cedar-paw-toe-3" />
+                    <span className="cedar-paw-toe cedar-paw-toe-4" />
+                    <span className="cedar-paw-pad" />
+                  </span>
+                  <span className="cedar-paw-text">Send</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </footer>
+      </div>
+
+      <aside className={`cedar-context ${contextOpen ? "cedar-context-open" : ""}`}>
+        <header className="cedar-context-head">
+          <span>Context</span>
+          <button
+            type="button"
+            onClick={() => setContextOpen(false)}
+            className="cedar-icon-button"
+            aria-label="Close context"
+          >
+            x
+          </button>
+        </header>
+        <div className="cedar-context-body">
+          <section>
+            <div className="cedar-context-label">Memory</div>
+            <div className="cedar-context-value">
+              {contextSections.length > 0
+                ? `${contextSections.length} active sections`
+                : "No active memory"}
+            </div>
+          </section>
+          <section>
+            <div className="cedar-context-label">Active Skills</div>
+            <div className="cedar-context-value">
+              {enabledMcpServers.length > 0
+                ? `${enabledMcpServers.length} MCP server${
+                    enabledMcpServers.length === 1 ? "" : "s"
+                  }`
+                : "No MCP tools"}
+            </div>
+          </section>
+          <section>
+            <div className="cedar-context-label">Tokens</div>
+            <div className="cedar-context-value">
+              {lastUsage
+                ? `in ${lastUsage.inputTokens} · out ${lastUsage.outputTokens}`
+                : "No usage yet"}
+            </div>
+          </section>
+          <section>
+            <div className="cedar-context-label">Cache</div>
+            <div className="cedar-context-value">
+              agent {activeAgentPromptCache} · context {activeContextPromptCache}
+            </div>
+          </section>
         </div>
-      </footer>
+      </aside>
 
       {/* Settings 抽屉 */}
       <Settings
@@ -3399,7 +3705,6 @@ export default function App() {
         onChange={handleAgentsChange}
         onSelect={selectAgent}
       />
-      </div>
     </div>
   );
 }
@@ -4190,13 +4495,13 @@ function VoiceMessageView({
   }, [autoPlay, block.audioUrl, block.id, block.status, onAutoPlayAttempted]);
 
   return (
-    <div className="my-2 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-neutral-900 dark:border-blue-900 dark:bg-blue-950 dark:text-neutral-100">
+    <div className="cedar-voice-message">
       <div className="mb-2 flex items-center justify-between gap-3">
-        <span className="text-xs font-medium uppercase tracking-wide text-blue-600 dark:text-blue-300">
+        <span className="cedar-voice-label">
           语音消息
         </span>
         {block.status === "pending" && (
-          <span className="text-xs text-neutral-500 dark:text-neutral-400">
+          <span className="cedar-voice-status">
             生成中...
           </span>
         )}
@@ -4204,7 +4509,7 @@ function VoiceMessageView({
           <button
             type="button"
             onClick={() => onGenerate?.(block.id)}
-            className="rounded px-2 py-1 text-xs text-blue-700 hover:bg-blue-100 dark:text-blue-200 dark:hover:bg-blue-900"
+            className="cedar-voice-button"
           >
             {block.status === "error" ? "重试" : "生成语音"}
           </button>
@@ -4326,7 +4631,8 @@ interface MessageViewProps {
   message: UIMessage;
   busy: boolean;
   canChat: boolean;
-  showTimestamp: boolean;
+  assistantName: string;
+  modelName: string | null;
   isEditing: boolean;
   editingText: string;
   isLastAssistant: boolean;
@@ -4348,7 +4654,8 @@ function MessageView({
   message,
   busy,
   canChat,
-  showTimestamp,
+  assistantName,
+  modelName,
   isEditing,
   editingText,
   isLastAssistant,
@@ -4366,37 +4673,43 @@ function MessageView({
   onVoiceAutoPlayAttempted,
 }: MessageViewProps) {
   const isUser = message.role === "user";
-  const timestampLabel = showTimestamp
-    ? formatMessageTimestamp(message.createdAt)
-    : "";
+  const timestampLabel = formatMessageTimestamp(message.createdAt);
+  const authorLabel = isUser ? "You" : assistantName;
   return (
-    <div className={`group flex flex-col ${isUser ? "items-end" : "items-start"}`}>
+    <article
+      className={`group cedar-message ${
+        isUser ? "message-flora" : "message-cedar"
+      } ${message.streaming && !isUser ? "cedar-thinking" : ""}`}
+    >
+      <div className="message-meta">
+        <span>{authorLabel}</span>
+        {!isUser && modelName && <span> · {modelName}</span>}
+        {timestampLabel && <span> · {timestampLabel}</span>}
+      </div>
       <div
-        className={`max-w-[92%] rounded-2xl px-4 py-2.5 sm:max-w-[80%] ${
-          isUser
-            ? "bg-blue-600 text-white"
-            : "bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700"
+        className={`cedar-message-body ${
+          message.streaming && !isUser ? "cedar-streaming-text" : ""
         }`}
       >
         {isEditing ? (
-          <div className="w-full max-w-[82vw] space-y-2 sm:w-96 sm:max-w-[70vw]">
+          <div className="cedar-edit-box">
             <textarea
-              className="input min-h-24 resize-y text-neutral-900 dark:text-neutral-100"
+              className="input min-h-24 resize-y"
               value={editingText}
               onChange={(e) => onEditingTextChange(e.target.value)}
               autoFocus
             />
-            <div className="flex justify-end gap-2">
+            <div className="cedar-edit-actions">
               <button
                 onClick={onCancelEdit}
-                className="rounded px-3 py-1 text-sm text-blue-50 hover:bg-blue-500"
+                className="cedar-ghost-button"
               >
                 Cancel
               </button>
               <button
                 onClick={onSaveEdit}
                 disabled={!canChat || !editingText.trim()}
-                className="rounded bg-white px-3 py-1 text-sm font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+                className="cedar-send-button"
               >
                 Save
               </button>
@@ -4437,7 +4750,7 @@ function MessageView({
           </>
         )}
         {message.usage && !message.streaming && (
-          <div className="mt-2 text-[11px] text-neutral-400 dark:text-neutral-500 font-mono">
+          <div className="cedar-usage-line">
             in: {message.usage.inputTokens} · out: {message.usage.outputTokens}
             {message.usage.cachedInputTokens !== undefined && (
               <> · cached: {message.usage.cachedInputTokens}</>
@@ -4448,22 +4761,13 @@ function MessageView({
           </div>
         )}
       </div>
-      {timestampLabel && (
-        <div className="mt-1 px-1 text-[11px] text-neutral-400 dark:text-neutral-500">
-          {timestampLabel}
-        </div>
-      )}
       {!isEditing && (
-        <div
-          className={`mt-1 flex gap-1 px-1 text-xs opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 ${
-            isUser ? "justify-end" : "justify-start"
-          }`}
-        >
+        <div className="cedar-message-actions">
           {isUser ? (
             <button
               onClick={onStartEdit}
               disabled={busy || !canChat}
-              className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+              className="cedar-action-button"
             >
               Edit
             </button>
@@ -4472,7 +4776,7 @@ function MessageView({
               <button
                 onClick={onRegenerate}
                 disabled={busy || !canChat}
-                className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+                className="cedar-action-button"
               >
                 Regenerate
               </button>
@@ -4480,7 +4784,7 @@ function MessageView({
                 <button
                   onClick={onContinue}
                   disabled={busy || !canChat}
-                  className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+                  className="cedar-action-button"
                 >
                   Continue
                 </button>
@@ -4489,7 +4793,7 @@ function MessageView({
                 <button
                   onClick={onSpeak}
                   disabled={busy && !speaking}
-                  className="rounded px-2 py-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+                  className="cedar-action-button"
                 >
                   {speaking ? "停止语音" : "语音"}
                 </button>
@@ -4498,7 +4802,7 @@ function MessageView({
           )}
         </div>
       )}
-    </div>
+    </article>
   );
 }
 
