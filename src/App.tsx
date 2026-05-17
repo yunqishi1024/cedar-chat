@@ -10,6 +10,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type ClipboardEvent,
   type DragEvent,
 } from "react";
@@ -43,6 +44,7 @@ import {
   loadCurrent,
   saveCurrent,
   loadPreferences,
+  normalizeChatFontSize,
   savePreferences,
   loadTtsSettings,
   saveTtsSettings,
@@ -136,6 +138,14 @@ const MAX_MCP_RESULT_CHARS = 120_000;
 const MAX_TOOL_BLOCK_CHARS = 4_000;
 const WEATHER_LOCATION = "Beijing";
 const WEATHER_FALLBACK_LABEL = "多云";
+const TOKENS_PER_MILLION = 1_000_000;
+const OPUS_46_47_PRICING_PER_MTOK = {
+  input: 5,
+  cacheWrite5m: 6.25,
+  cacheWrite1h: 10,
+  cacheRead: 0.5,
+  output: 25,
+};
 
 type WindowSettingsPatch = Partial<
   Pick<
@@ -273,6 +283,7 @@ function stripTransient(message: UIMessage): StoredMessage {
   return {
     id: message.id,
     role: message.role,
+    model: message.model,
     content: stripTransientContentBlocks(message.content),
     createdAt: message.createdAt,
     usage: message.usage,
@@ -344,6 +355,7 @@ function assistantMessagesFromContentSets(
   return sets.map((content, index) => ({
     id: index === 0 ? assistantMessage.id : uid(),
     role: "assistant" as const,
+    model: assistantMessage.model,
     content,
     createdAt: assistantMessage.createdAt,
     usage: index === lastIndex ? usage : undefined,
@@ -509,6 +521,77 @@ function mergeUsage(
     cacheWriteInputTokens:
       (previous.cacheWriteInputTokens ?? 0) +
       (next.cacheWriteInputTokens ?? 0),
+  };
+}
+
+function isOpus46Or47Model(modelName: string | null): boolean {
+  const normalized = modelName?.toLowerCase().replace(/[^a-z0-9]+/g, "-") ?? "";
+  return /opus-?4-?[67](?:-|$)/.test(normalized);
+}
+
+function tokenCost(tokens: number, pricePerMillion: number): number {
+  return (tokens / TOKENS_PER_MILLION) * pricePerMillion;
+}
+
+function formatUsd(amount: number): string {
+  if (amount === 0) return "$0.0000";
+  if (amount < 0.001) return `$${amount.toFixed(6)}`;
+  if (amount < 0.1) return `$${amount.toFixed(4)}`;
+  return `$${amount.toFixed(2)}`;
+}
+
+function estimateMessageCost(
+  modelName: string | null,
+  usage: NonNullable<UIMessage["usage"]>,
+): { label: string; title: string } | null {
+  const modelMatched = isOpus46Or47Model(modelName);
+  const cachedInputTokens = Math.max(0, usage.cachedInputTokens ?? 0);
+  const cacheWriteInputTokens = Math.max(0, usage.cacheWriteInputTokens ?? 0);
+  const cacheTokens = cachedInputTokens + cacheWriteInputTokens;
+  const inputTokens = Math.max(0, usage.inputTokens);
+  const outputTokens = Math.max(0, usage.outputTokens);
+
+  const inputIncludesCache = cacheTokens > 0 && inputTokens >= cacheTokens;
+  const standardInputTokens = inputIncludesCache
+    ? inputTokens - cacheTokens
+    : inputTokens;
+
+  const standardInputCost = tokenCost(
+    standardInputTokens,
+    OPUS_46_47_PRICING_PER_MTOK.input,
+  );
+  const cacheReadCost = tokenCost(
+    cachedInputTokens,
+    OPUS_46_47_PRICING_PER_MTOK.cacheRead,
+  );
+  const cacheWriteCost5m = tokenCost(
+    cacheWriteInputTokens,
+    OPUS_46_47_PRICING_PER_MTOK.cacheWrite5m,
+  );
+  const cacheWriteCost1h = tokenCost(
+    cacheWriteInputTokens,
+    OPUS_46_47_PRICING_PER_MTOK.cacheWrite1h,
+  );
+  const outputCost = tokenCost(outputTokens, OPUS_46_47_PRICING_PER_MTOK.output);
+  const minCost =
+    standardInputCost + cacheReadCost + cacheWriteCost5m + outputCost;
+  const maxCost =
+    standardInputCost + cacheReadCost + cacheWriteCost1h + outputCost;
+  const label =
+    Math.abs(maxCost - minCost) < 0.000001
+      ? `≈ ${formatUsd(maxCost)}`
+      : `≈ ${formatUsd(minCost)}-${formatUsd(maxCost)}`;
+
+  return {
+    label,
+    title:
+      "Claude Opus 4.6/4.7 standard API estimate" +
+      (modelMatched ? "" : " (model name was not recognized, using Opus pricing)") +
+      ". " +
+      `input ${standardInputTokens} @ $5/M, ` +
+      `cache hit ${cachedInputTokens} @ $0.50/M, ` +
+      `cache write ${cacheWriteInputTokens} @ $6.25-$10/M, ` +
+      `output ${outputTokens} @ $25/M.`,
   };
 }
 
@@ -1359,6 +1442,9 @@ function isStoredMessage(value: unknown): value is StoredMessage {
   return (
     typeof value.id === "string" &&
     (value.role === "user" || value.role === "assistant") &&
+    (value.model === undefined ||
+      value.model === null ||
+      typeof value.model === "string") &&
     Array.isArray(value.content) &&
     value.content.every(isContentBlock) &&
     (value.createdAt === undefined || typeof value.createdAt === "number")
@@ -1459,14 +1545,17 @@ function mcpServersFromSync(value: unknown): McpServerConfig[] {
 }
 
 function preferencesFromSync(value: unknown): Preferences {
-  if (!isRecord(value)) return { historyDepth: "all" };
+  if (!isRecord(value)) return { historyDepth: "all", chatFontSize: 18 };
   const historyDepth =
     value.historyDepth === "all"
       ? "all"
       : typeof value.historyDepth === "number" && Number.isFinite(value.historyDepth)
         ? Math.max(0, Math.min(300, Math.round(value.historyDepth)))
         : "all";
-  return { historyDepth };
+  return {
+    historyDepth,
+    chatFontSize: normalizeChatFontSize(value.chatFontSize),
+  };
 }
 
 function ttsSettingsFromSync(value: unknown): TtsSettings | null {
@@ -1994,6 +2083,13 @@ export default function App() {
       selectedModel &&
       hasUserContent(input, pendingAttachments) &&
       !attaching,
+  );
+  const appStyle = useMemo(
+    () =>
+      ({
+        "--cedar-chat-font-size": `${preferences.chatFontSize}px`,
+      }) as CSSProperties,
+    [preferences.chatFontSize],
   );
 
   // --- 持久化副作用 ---
@@ -2595,6 +2691,7 @@ export default function App() {
     const assistantMessage: UIMessage = {
       id: uid(),
       role: "assistant",
+      model: selectedModel,
       content: [],
       createdAt: now,
       streaming: true,
@@ -2910,6 +3007,7 @@ export default function App() {
     const assistantMessage: UIMessage = {
       id: uid(),
       role: "assistant",
+      model: selectedModel,
       content: [],
       createdAt: timestampNow(),
       streaming: true,
@@ -2951,6 +3049,7 @@ export default function App() {
     const assistantMessage: UIMessage = {
       id: uid(),
       role: "assistant",
+      model: selectedModel,
       content: [],
       createdAt: timestampNow(),
       streaming: true,
@@ -3018,6 +3117,7 @@ export default function App() {
     const assistantMessage: UIMessage = {
       id: uid(),
       role: "assistant",
+      model: selectedModel,
       content: [],
       createdAt: timestampNow(),
       streaming: true,
@@ -3404,7 +3504,7 @@ export default function App() {
   // --- Render ---
 
   return (
-    <div className="cedar-app">
+    <div className="cedar-app" style={appStyle}>
       {sidebarOpen && (
         <button
           type="button"
@@ -3621,7 +3721,11 @@ export default function App() {
                 busy={busy}
                 canChat={Boolean(currentProvider && selectedModel)}
                 assistantName={activeConversationAgent?.name ?? "Cedar"}
-                modelName={m.role === "assistant" ? selectedModel : null}
+                modelName={
+                  m.role === "assistant"
+                    ? (m.model ?? activeConversation?.model ?? selectedModel)
+                    : null
+                }
                 isEditing={editingMessageId === m.id}
                 editingText={editingText}
                 isLastAssistant={m.id === lastAssistantId}
@@ -4804,6 +4908,10 @@ function MessageView({
   const isUser = message.role === "user";
   const timestampLabel = formatMessageTimestamp(message.createdAt);
   const authorLabel = isUser ? "You" : assistantName;
+  const costEstimate =
+    message.usage && !message.streaming
+      ? estimateMessageCost(modelName, message.usage)
+      : null;
   return (
     <article
       className={`group cedar-message ${
@@ -4881,6 +4989,14 @@ function MessageView({
         )}
         {message.usage && !message.streaming && (
           <div className="cedar-usage-line">
+            {costEstimate && (
+              <>
+                <span title={costEstimate.title}>
+                  cost: {costEstimate.label}
+                </span>{" "}
+                ·{" "}
+              </>
+            )}
             in: {message.usage.inputTokens} · out: {message.usage.outputTokens}
             {message.usage.cachedInputTokens !== undefined && (
               <> · cached: {message.usage.cachedInputTokens}</>

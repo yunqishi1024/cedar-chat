@@ -24,6 +24,7 @@ export interface Preferences {
   // 发请求时最多带多少条历史消息。"all" 表示不限。
   // 不含"当前这一条"，只算已经在对话里的历史。
   historyDepth: number | "all";
+  chatFontSize: number;
 }
 
 export type TtsProviderKind = "elevenlabs" | "minimax" | "azure" | "edge";
@@ -61,6 +62,7 @@ export type ThinkingMode = "effort" | "budget";
 export interface StoredMessage {
   id: string;
   role: "user" | "assistant";
+  model?: string | null;
   content: ContentBlock[];
   createdAt?: number;
   usage?: {
@@ -124,7 +126,28 @@ export interface SyncSettings {
 
 const DEFAULT_PREFS: Preferences = {
   historyDepth: "all",
+  chatFontSize: 18,
 };
+
+export function normalizeChatFontSize(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(14, Math.min(24, Math.round(value)))
+    : DEFAULT_PREFS.chatFontSize;
+}
+
+function normalizePreferences(value: unknown): Preferences {
+  if (!isRecord(value)) return DEFAULT_PREFS;
+  const historyDepth =
+    value.historyDepth === "all"
+      ? "all"
+      : typeof value.historyDepth === "number" && Number.isFinite(value.historyDepth)
+        ? Math.max(0, Math.min(300, Math.round(value.historyDepth)))
+        : DEFAULT_PREFS.historyDepth;
+  return {
+    historyDepth,
+    chatFontSize: normalizeChatFontSize(value.chatFontSize),
+  };
+}
 
 const DEFAULT_TTS_PROFILE: Omit<TtsProfile, "id"> = {
   name: "Browser voice",
@@ -156,7 +179,7 @@ export function loadPreferences(): Preferences {
   try {
     const raw = localStorage.getItem(PREFS_KEY);
     if (!raw) return DEFAULT_PREFS;
-    return { ...DEFAULT_PREFS, ...JSON.parse(raw) };
+    return normalizePreferences(JSON.parse(raw) as unknown);
   } catch {
     return DEFAULT_PREFS;
   }

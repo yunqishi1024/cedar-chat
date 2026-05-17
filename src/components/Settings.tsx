@@ -992,10 +992,56 @@ function PreferencesPanel({
   const depth = preferences.historyDepth;
   const isUnlimited = depth === "all";
   const numericDepth = typeof depth === "number" ? depth : 20;
+  const chatFontSize = preferences.chatFontSize;
 
   return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-6">
       <div className="max-w-xl space-y-6">
+        <section>
+          <h3 className="text-sm font-medium text-neutral-700 dark:text-neutral-300 mb-2">
+            Chat text size
+          </h3>
+          <p className="text-xs text-neutral-500 mb-3">
+            Adjust the reading size for message text and the composer.
+          </p>
+
+          <div className="flex items-center gap-3">
+            <input
+              type="range"
+              min={14}
+              max={24}
+              step={1}
+              value={chatFontSize}
+              onChange={(e) =>
+                onChange({
+                  ...preferences,
+                  chatFontSize: parseInt(e.target.value),
+                })
+              }
+              className="flex-1"
+              aria-label="Chat text size"
+            />
+            <input
+              type="number"
+              min={14}
+              max={24}
+              value={chatFontSize}
+              onChange={(e) =>
+                onChange({
+                  ...preferences,
+                  chatFontSize: Math.max(
+                    14,
+                    Math.min(24, parseInt(e.target.value) || 18),
+                  ),
+                })
+              }
+              className="input w-20"
+              aria-label="Chat text size in pixels"
+            />
+            <span className="text-sm text-neutral-500">px</span>
+          </div>
+        </section>
+
         <section>
           <h3 className="text-sm font-medium text-neutral-700 dark:text-neutral-300 mb-2">
             Conversation history
