@@ -92,6 +92,8 @@ import {
   type CedarSyncSnapshot,
 } from "./lib/sync";
 
+import { useAutoSync } from "./lib/useAutoSync";
+
 // ------------------------- Message type (UI-level) -------------------------
 
 interface UIMessage extends StoredMessage {
@@ -3492,6 +3494,28 @@ export default function App() {
       setSyncBusy(false);
     }
   }
+
+    // --- Auto Sync ---
+  useAutoSync(syncSettings, {
+    createSnapshot: createSyncSnapshot,
+    mergeAndApply: (local, cloud) => mergeSyncSnapshots(local, cloud),
+    applySnapshot: applySyncSnapshot,
+    onSyncComplete: (pushed, pulled) => {
+      const now = Date.now();
+      setSyncSettings((prev) => ({
+        ...prev,
+        lastPushedAt: pushed ? now : prev.lastPushedAt,
+        lastPulledAt: pulled ? now : prev.lastPulledAt,
+      }));
+    },
+    onSyncError: (err) => {
+      console.warn("[auto-sync]", err.message);
+    },
+    onSyncStatus: (msg) => {
+      if (msg) setSyncStatus(msg);
+      else setSyncStatus(null);
+    },
+  });
 
   function handleAgentsChange(nextAgents: Agent[]) {
     if (nextAgents.length === 0) return;
