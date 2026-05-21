@@ -4909,6 +4909,42 @@ function ToolBlockView({ block }: { block: ToolBlock }) {
   );
 }
 
+// ------------------------- Copy button component -------------------------
+
+function CopyButton({ content }: { content: ContentBlock[] }) {
+  const [copied, setCopied] = useState(false);
+
+  async function handleCopy() {
+    const text = contentBlocksToPlainText(content, true);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Fallback for older browsers / insecure contexts
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  }
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="cedar-action-button"
+    >
+      {copied ? "Copied!" : "Copy"}
+    </button>
+  );
+}
+
 // ------------------------- Message component -------------------------
 
 interface MessageViewProps {
@@ -5097,6 +5133,7 @@ function MessageView({
                   {speaking ? "停止语音" : "语音"}
                 </button>
               )}
+                <CopyButton content={message.content} />
             </>
           )}
         </div>
