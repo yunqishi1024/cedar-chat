@@ -61,16 +61,25 @@ export function useAutoSync(
     try {
       onSyncStatus?.("Auto-syncing...");
       const localSnapshot = createSnapshot();
-      const cloudSnapshot = await pullSyncSnapshot(settings);
-      const mergedSnapshot = cloudSnapshot
-        ? mergeAndApply(localSnapshot, cloudSnapshot)
-        : localSnapshot;
 
+      // Step 1: Upload local first (保证本地数据安全)
+      await pushSyncSnapshot(settings, localSnapshot);
+
+      // Step 2: Pull cloud and merge
+      const cloudSnapshot = await pullSyncSnapshot(settings);
       if (cloudSnapshot) {
-        applySnapshot(mergedSnapshot);
+        const mergedSnapshot = mergeAndApply(localSnapshot, cloudSnapshot);
+
+        // 只在有新内容时才 apply
+        const localIds = localSnapshot.conversations.map(c => c.id).sort().join(",");
+        const mergedIds = mergedSnapshot.conversations.map(c => c.id).sort().join(",");
+        if (localIds !== mergedIds) {
+          applySnapshot(mergedSnapshot);
+          // Push merged result back
+          await pushSyncSnapshot(settings, mergedSnapshot);
+        }
       }
 
-      await pushSyncSnapshot(settings, mergedSnapshot);
       onSyncComplete(true, Boolean(cloudSnapshot));
       onSyncStatus?.(null as unknown as string);
     } catch (error: unknown) {
@@ -81,7 +90,7 @@ export function useAutoSync(
       busyRef.current = false;
     }
   }, [canSync]);
-
+  
   // Periodic interval
   useEffect(() => {
     if (!syncSettings.autoSyncEnabled) return;
