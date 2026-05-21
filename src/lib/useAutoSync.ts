@@ -36,15 +36,6 @@ export function useAutoSync(
   const settingsRef = useRef(syncSettings);
   settingsRef.current = syncSettings;
 
-  const canSync = useCallback((): boolean => {
-    const s = settingsRef.current;
-    return (
-      s.autoSyncEnabled &&
-      Boolean(s.endpoint.trim()) &&
-      s.syncCode.trim().length >= 8
-    );
-  }, []);
-
   const doSync = useCallback(async () => {
     if (busyRef.current) return;
     if (!canSync()) return;
@@ -59,24 +50,37 @@ export function useAutoSync(
       onSyncStatus?.("Auto-syncing...");
       const localSnapshot = createSnapshot();
 
-      // Step 1: Upload local first (保证本地数据安全)
-      await pushSyncSnapshot(settings, localSnapshot);
+      // 保护：本地没有对话时，只 pull 不 push（防止空数据覆盖云端）
+      if (localSnapshot.conversations.length === 0 || 
+          (localSnapshot.conversations.length === 1 && localSnapshot.conversations[0].messages.length === 0)) {
+        const cloudSnapshot = await pullSyncSnapshot(settings);
+        if (cloudSnapshot && cloudSnapshot.conversations.length > 0) {
+          applySnapshot(cloudSnapshot);
+        }
+        onSyncComplete(false, Boolean(cloudSnapshot));
+        onSyncStatus?.(null as unknown as string);
+        return;
+      }
 
-      // Step 2: Pull cloud and merge
+      // Step 1: Pull first
       const cloudSnapshot = await pullSyncSnapshot(settings);
-      if (cloudSnapshot) {
-        const mergedSnapshot = mergeAndApply(localSnapshot, cloudSnapshot);
 
-        // 只在有新内容时才 apply
+      // Step 2: Merge
+      const mergedSnapshot = cloudSnapshot
+        ? mergeAndApply(localSnapshot, cloudSnapshot)
+        : localSnapshot;
+
+      // Step 3: Apply only if cloud had extra content
+      if (cloudSnapshot) {
         const localIds = localSnapshot.conversations.map(c => c.id).sort().join(",");
         const mergedIds = mergedSnapshot.conversations.map(c => c.id).sort().join(",");
         if (localIds !== mergedIds) {
           applySnapshot(mergedSnapshot);
-          // Push merged result back
-          await pushSyncSnapshot(settings, mergedSnapshot);
         }
       }
 
+      // Step 4: Push merged result
+      await pushSyncSnapshot(settings, mergedSnapshot);
       onSyncComplete(true, Boolean(cloudSnapshot));
       onSyncStatus?.(null as unknown as string);
     } catch (error: unknown) {
