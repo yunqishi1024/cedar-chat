@@ -10,8 +10,6 @@ import {
   useMemo,
   useRef,
   useState,
-  loadUserStyle,
-  saveUserStyle,
   type CSSProperties,
   type ClipboardEvent,
   type DragEvent,
@@ -77,6 +75,8 @@ import {
   type Preferences,
   type SyncSettings,
   type TtsSettings,
+  loadUserStyle,
+  saveUserStyle,
 } from "./lib/storage";
 import {
   callMcpTool,
