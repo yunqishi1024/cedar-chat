@@ -30,6 +30,7 @@ interface Props {
   syncSettings: SyncSettings;
   syncBusy: boolean;
   syncStatus: string | null;
+  userStyle: string;                          // ← 新增
   onClose: () => void;
   onChange: (providers: ProviderConfig[]) => void;
   onActiveTabChange: (tab: SettingsTab) => void;
@@ -39,6 +40,7 @@ interface Props {
   onSyncSettingsChange: (settings: SyncSettings) => void;
   onSyncPush: () => void;
   onSyncPull: () => void;
+  onUserStyleChange: (style: string) => void; // ← 新增
 }
 
 export type SettingsTab = "providers" | "preferences" | "mcp" | "tts" | "sync";
@@ -64,6 +66,7 @@ export function Settings({
   syncSettings,
   syncBusy,
   syncStatus,
+  userStyle,            // ← 新增
   onClose,
   onChange,
   onActiveTabChange,
@@ -73,6 +76,7 @@ export function Settings({
   onSyncSettingsChange,
   onSyncPush,
   onSyncPull,
+  onUserStyleChange,    // ← 新增
 }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<ProviderConfig | null>(null);
@@ -200,7 +204,9 @@ export function Settings({
         {activeTab === "preferences" ? (
           <PreferencesPanel
             preferences={preferences}
+            userStyle={userStyle}
             onChange={onPreferencesChange}
+            onUserStyleChange={onUserStyleChange}
           />
         ) : activeTab === "tts" ? (
           <TtsPanel settings={ttsSettings} onChange={onTtsSettingsChange} />
@@ -984,10 +990,14 @@ function formatSyncTime(value: number | null): string {
 
 function PreferencesPanel({
   preferences,
+  userStyle,
   onChange,
+  onUserStyleChange,
 }: {
   preferences: Preferences;
+  userStyle: string;
   onChange: (p: Preferences) => void;
+  onUserStyleChange: (style: string) => void;
 }) {
   const depth = preferences.historyDepth;
   const isUnlimited = depth === "all";
@@ -1106,6 +1116,22 @@ function PreferencesPanel({
             <strong>0</strong> = one-shot (no history).{" "}
             <strong>20</strong> ≈ last 10 user/assistant pairs.
           </p>
+        </section>
+        <section>
+          <h3 className="text-sm font-medium text-neutral-700 dark:text-neutral-300 mb-2">
+            User Style
+          </h3>
+          <p className="text-xs text-neutral-500 mb-3">
+            Custom style instructions appended to the system prompt for every
+            message, regardless of which Agent is active.
+          </p>
+          <textarea
+            className="input w-full font-mono text-sm"
+            rows={5}
+            placeholder="e.g. Reply in concise Chinese. Use TypeScript for code examples. Avoid emoji."
+            value={userStyle}
+            onChange={(e) => onUserStyleChange(e.target.value)}
+          />
         </section>
       </div>
     </div>
