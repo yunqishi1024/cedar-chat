@@ -2358,7 +2358,7 @@ export default function App() {
             };
             const content = Array.isArray(m.content)
               ? [...m.content, styleBlock]
-              : [{ type: "text" as const, text: m.content }, styleBlock];
+              : [{ type: "text" as const, text: m.content ?? "" }, styleBlock];
             return { ...m, content };
           })
         : finalRequestMessages;
