@@ -123,6 +123,8 @@ export interface SyncSettings {
   deviceName: string;
   lastPushedAt: number | null;
   lastPulledAt: number | null;
+  autoSyncEnabled: boolean;       // <-- 新增
+  autoSyncIntervalMs: number;     // <-- 新增
 }
 
 const DEFAULT_PREFS: Preferences = {
@@ -174,6 +176,8 @@ const DEFAULT_SYNC_SETTINGS: SyncSettings = {
   deviceName: "",
   lastPushedAt: null,
   lastPulledAt: null,
+  autoSyncEnabled: false,         // <-- 新增
+  autoSyncIntervalMs: 30_000,     // <-- 新增，默认30秒
 };
 
 export function loadPreferences(): Preferences {
@@ -334,6 +338,13 @@ function normalizeSyncSettings(value: unknown): SyncSettings {
       typeof value.lastPulledAt === "number" && Number.isFinite(value.lastPulledAt)
         ? value.lastPulledAt
         : null,
+    autoSyncEnabled:
+      typeof value.autoSyncEnabled === "boolean" ? value.autoSyncEnabled : false,
+    autoSyncIntervalMs:
+      typeof value.autoSyncIntervalMs === "number" &&
+      Number.isFinite(value.autoSyncIntervalMs)
+        ? Math.max(10_000, Math.min(600_000, Math.round(value.autoSyncIntervalMs)))
+        : 30_000,
   };
 }
 
