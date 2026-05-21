@@ -10,6 +10,8 @@ import {
   useMemo,
   useRef,
   useState,
+  loadUserStyle,
+  saveUserStyle,
   type CSSProperties,
   type ClipboardEvent,
   type DragEvent,
@@ -139,6 +141,7 @@ const MAX_TOOL_BLOCK_CHARS = 4_000;
 const WEATHER_LOCATION = "Beijing";
 const WEATHER_FALLBACK_LABEL = "多云";
 const TOKENS_PER_MILLION = 1_000_000;
+const [userStyle, setUserStyle] = useState(() => loadUserStyle());
 const OPUS_46_47_PRICING_PER_MTOK = {
   input: 5,
   cacheWrite5m: 6.25,
@@ -166,6 +169,11 @@ type WindowSettingsPatch = Partial<
     | "voiceMessageBudgetTokens"
   >
 >;
+
+function handleUserStyleChange(style: string) {
+  setUserStyle(style);
+  saveUserStyle(style);
+}
 
 function uid() {
   return "m_" + Math.random().toString(36).slice(2, 10);
@@ -1144,6 +1152,7 @@ function requestSystemContent(
   multiMessageEnabled: boolean,
   voiceMessagesEnabled: boolean,
   voiceMessageBudgetTokens: number,
+  userStyle: string,
 ): ChatTextContentPart[] | undefined {
   const parts = agentSystemContent(agent, agentPromptCache, cacheEnabled) ?? [];
   if (injectCurrentTime && contextPromptCache === "off") {
@@ -1154,6 +1163,13 @@ function requestSystemContent(
   }
   if (voiceMessagesEnabled) {
     parts.push(voiceMessagePromptContent(voiceMessageBudgetTokens));
+  }
+    // Inject user style
+  if (userStyle.trim()) {
+    parts.push({
+      type: "text",
+      text: `# User Style\n${userStyle.trim()}`,
+    });
   }
   return parts.length > 0 ? parts : undefined;
 }
@@ -2728,6 +2744,7 @@ export default function App() {
         multiMessageEnabled,
         voiceMessagesEnabled && ttsVoiceMessagesAvailable,
         voiceMessageBudgetTokens,
+        userStyle,
       ),
       activeContextPromptCache,
       activeConversation.injectCurrentTime,
@@ -3035,6 +3052,7 @@ export default function App() {
         multiMessageEnabled,
         voiceMessagesEnabled && ttsVoiceMessagesAvailable,
         voiceMessageBudgetTokens,
+        userStyle,
       ),
       activeContextPromptCache,
       activeConversation.injectCurrentTime,
@@ -3079,6 +3097,7 @@ export default function App() {
         multiMessageEnabled,
         voiceMessagesEnabled && ttsVoiceMessagesAvailable,
         voiceMessageBudgetTokens,
+        userStyle,
       ),
       activeContextPromptCache,
       activeConversation.injectCurrentTime,
@@ -3153,6 +3172,7 @@ export default function App() {
         multiMessageEnabled,
         voiceMessagesEnabled && ttsVoiceMessagesAvailable,
         voiceMessageBudgetTokens,
+        userStyle,
       ),
       activeContextPromptCache,
       activeConversation.injectCurrentTime,
@@ -3893,6 +3913,8 @@ export default function App() {
         onSyncSettingsChange={setSyncSettings}
         onSyncPush={handleSyncPush}
         onSyncPull={handleSyncPull}
+        userStyle={userStyle}
+        onUserStyleChange={handleUserStyleChange}
       />
       <ExportDialog
         open={exportOpen}
