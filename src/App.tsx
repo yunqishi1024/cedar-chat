@@ -1148,7 +1148,6 @@ function requestSystemContent(
   multiMessageEnabled: boolean,
   voiceMessagesEnabled: boolean,
   voiceMessageBudgetTokens: number,
-  userStyle: string,
 ): ChatTextContentPart[] | undefined {
   const parts = agentSystemContent(agent, agentPromptCache, cacheEnabled) ?? [];
   if (injectCurrentTime && contextPromptCache === "off") {
@@ -1159,13 +1158,6 @@ function requestSystemContent(
   }
   if (voiceMessagesEnabled) {
     parts.push(voiceMessagePromptContent(voiceMessageBudgetTokens));
-  }
-    // Inject user style
-  if (userStyle.trim()) {
-    parts.push({
-      type: "text",
-      text: `# User Style\n${userStyle.trim()}`,
-    });
   }
   return parts.length > 0 ? parts : undefined;
 }
@@ -2352,7 +2344,24 @@ export default function App() {
             currentTimePromptContent(),
           )
         : requestMessages;
-      let modelMessages: ChatMessage[] = finalRequestMessages;
+      // Inject userStyle into the last user message (like Claude AI)
+      let modelMessages: ChatMessage[] = userStyle.trim()
+        ? finalRequestMessages.map((m, i) => {
+            // Find the last user message
+            const isLastUser =
+              m.role === "user" &&
+              !finalRequestMessages.slice(i + 1).some((x) => x.role === "user");
+            if (!isLastUser) return m;
+            const styleBlock: ChatContentPart = {
+              type: "text",
+              text: `<userStyle>${userStyle.trim()}</userStyle>`,
+            };
+            const content = Array.isArray(m.content)
+              ? [...m.content, styleBlock]
+              : [{ type: "text" as const, text: m.content }, styleBlock];
+            return { ...m, content };
+          })
+        : finalRequestMessages;
 
       // 流式累积
       let textBuf = "";
@@ -2361,6 +2370,7 @@ export default function App() {
       let finalUsage: UIMessage["usage"] = undefined;
       let stoppedByToolRoundLimit = false;
 
+      
       const commitAssistantBlocks = (blocks: ContentBlock[]) => {
         setConversations((prev) =>
           prev.map((c) =>
@@ -2746,7 +2756,6 @@ export default function App() {
         multiMessageEnabled,
         voiceMessagesEnabled && ttsVoiceMessagesAvailable,
         voiceMessageBudgetTokens,
-        userStyle,
       ),
       activeContextPromptCache,
       activeConversation.injectCurrentTime,
@@ -3054,7 +3063,6 @@ export default function App() {
         multiMessageEnabled,
         voiceMessagesEnabled && ttsVoiceMessagesAvailable,
         voiceMessageBudgetTokens,
-        userStyle,
       ),
       activeContextPromptCache,
       activeConversation.injectCurrentTime,
@@ -3099,7 +3107,6 @@ export default function App() {
         multiMessageEnabled,
         voiceMessagesEnabled && ttsVoiceMessagesAvailable,
         voiceMessageBudgetTokens,
-        userStyle,
       ),
       activeContextPromptCache,
       activeConversation.injectCurrentTime,
@@ -3174,7 +3181,6 @@ export default function App() {
         multiMessageEnabled,
         voiceMessagesEnabled && ttsVoiceMessagesAvailable,
         voiceMessageBudgetTokens,
-        userStyle,
       ),
       activeContextPromptCache,
       activeConversation.injectCurrentTime,
