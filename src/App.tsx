@@ -2345,23 +2345,22 @@ export default function App() {
           )
         : requestMessages;
       // Inject userStyle into the last user message (like Claude AI)
-      let modelMessages: ChatMessage[] = userStyle.trim()
-        ? finalRequestMessages.map((m, i) => {
-            // Find the last user message
-            const isLastUser =
-              m.role === "user" &&
-              !finalRequestMessages.slice(i + 1).some((x) => x.role === "user");
-            if (!isLastUser) return m;
-            const styleBlock: ChatContentPart = {
-              type: "text",
-              text: `<userStyle>${userStyle.trim()}</userStyle>`,
-            };
-            const content = Array.isArray(m.content)
-              ? [...m.content, styleBlock]
-              : [{ type: "text" as const, text: m.content ?? "" }, styleBlock];
-            return { ...m, content };
-          })
-        : finalRequestMessages;
+      // Inject userStyle into the last user message (like Claude AI)
+      let modelMessages: ChatMessage[] = finalRequestMessages;
+      if (userStyle.trim()) {
+        const styleText = `<userStyle>${userStyle.trim()}</userStyle>`;
+        const lastUserIdx = modelMessages.map((m) => m.role).lastIndexOf("user");
+        if (lastUserIdx >= 0) {
+          const msg = modelMessages[lastUserIdx];
+          const parts: ChatContentPart[] = Array.isArray(msg.content)
+            ? msg.content
+            : [{ type: "text", text: msg.content ?? "" }];
+          parts.push({ type: "text", text: styleText });
+          modelMessages = modelMessages.map((m, i) =>
+            i === lastUserIdx ? { ...m, content: parts } : m,
+          );
+        }
+      }
 
       // 流式累积
       let textBuf = "";
