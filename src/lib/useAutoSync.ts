@@ -48,7 +48,7 @@ export function useAutoSync(
   const doSync = useCallback(async () => {
     if (busyRef.current) return;
     if (!canSync()) return;
-    if (isBusyRef.current) return; // AI 正在输出时跳过
+    if (callbacksRef.current.isStreaming()) return;
 
     busyRef.current = true;
     const { createSnapshot, mergeAndApply, applySnapshot, onSyncComplete, onSyncError, onSyncStatus } =
