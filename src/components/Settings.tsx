@@ -914,6 +914,7 @@ function SyncPanel({
   onPull: () => void;
 }) {
   const canSync = settings.endpoint.trim() && settings.syncCode.trim().length >= 8;
+  const intervalSeconds = Math.round(settings.autoSyncIntervalMs / 1000);
 
   return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-6">
@@ -967,6 +968,68 @@ function SyncPanel({
           >
             Upload only
           </button>
+        </div>
+
+        {/* Auto Sync Settings */}
+        <div className="border-t border-neutral-200 pt-4 dark:border-neutral-800">
+          <div className="flex items-center gap-3 mb-3">
+            <label className="flex items-center gap-2 text-sm font-medium text-neutral-700 dark:text-neutral-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.autoSyncEnabled}
+                disabled={!canSync}
+                onChange={(event) =>
+                  onChange({ ...settings, autoSyncEnabled: event.target.checked })
+                }
+                className="h-4 w-4 rounded border-neutral-300 text-blue-600 focus:ring-blue-500"
+              />
+              Auto Sync
+            </label>
+          </div>
+          {settings.autoSyncEnabled && (
+            <Field label="Sync Interval (seconds)">
+              <div className="flex items-center gap-3">
+                <input
+                  type="range"
+                  min={10}
+                  max={600}
+                  step={10}
+                  value={intervalSeconds}
+                  onChange={(event) =>
+                    onChange({
+                      ...settings,
+                      autoSyncIntervalMs: parseInt(event.target.value) * 1000,
+                    })
+                  }
+                  className="flex-1"
+                  aria-label="Auto sync interval"
+                />
+                <input
+                  type="number"
+                  min={10}
+                  max={600}
+                  value={intervalSeconds}
+                  onChange={(event) =>
+                    onChange({
+                      ...settings,
+                      autoSyncIntervalMs:
+                        Math.max(10, Math.min(600, parseInt(event.target.value) || 30)) *
+                        1000,
+                    })
+                  }
+                  className="input w-20"
+                  aria-label="Auto sync interval in seconds"
+                />
+                <span className="text-xs text-neutral-500">sec</span>
+              </div>
+            </Field>
+          )}
+          {settings.autoSyncEnabled && (
+            <p className="text-xs text-neutral-500 mt-2">
+              Automatically syncs when the tab is visible. Also syncs on tab
+              focus and network reconnect.
+            </p>
+          )}
         </div>
 
         <div className="space-y-1 text-xs text-neutral-500">
