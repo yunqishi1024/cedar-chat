@@ -14,6 +14,7 @@ const ACTIVE_AGENT_KEY = "cedar-chat.activeAgent";
 const MCP_SERVERS_KEY = "cedar-chat.mcpServers";
 const TTS_SETTINGS_KEY = "cedar-chat.ttsSettings";
 const SYNC_SETTINGS_KEY = "cedar-chat.syncSettings";
+const USER_STYLE_KEY = "cedar-chat.userStyle";
 
 export interface CurrentSelection {
   providerId: string | null;
@@ -187,6 +188,18 @@ export function loadPreferences(): Preferences {
 
 export function savePreferences(prefs: Preferences): void {
   safeSetLocalStorage(PREFS_KEY, JSON.stringify(prefs));
+}
+
+export function loadUserStyle(): string {
+  try {
+    return localStorage.getItem(USER_STYLE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function saveUserStyle(style: string): void {
+  safeSetLocalStorage(USER_STYLE_KEY, style);
 }
 
 export function loadTtsSettings(): TtsSettings {
