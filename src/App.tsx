@@ -3500,6 +3500,7 @@ export default function App() {
     createSnapshot: createSyncSnapshot,
     mergeAndApply: (local, cloud) => mergeSyncSnapshots(local, cloud),
     applySnapshot: applySyncSnapshot,
+    isStreaming: () => busy, // busy 就是 AI 正在输出的标志
     onSyncComplete: (pushed, pulled) => {
       const now = Date.now();
       setSyncSettings((prev) => ({
