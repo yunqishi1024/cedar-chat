@@ -141,7 +141,6 @@ const MAX_TOOL_BLOCK_CHARS = 4_000;
 const WEATHER_LOCATION = "Beijing";
 const WEATHER_FALLBACK_LABEL = "多云";
 const TOKENS_PER_MILLION = 1_000_000;
-const [userStyle, setUserStyle] = useState(() => loadUserStyle());
 const OPUS_46_47_PRICING_PER_MTOK = {
   input: 5,
   cacheWrite5m: 6.25,
@@ -170,10 +169,7 @@ type WindowSettingsPatch = Partial<
   >
 >;
 
-function handleUserStyleChange(style: string) {
-  setUserStyle(style);
-  saveUserStyle(style);
-}
+
 
 function uid() {
   return "m_" + Math.random().toString(36).slice(2, 10);
@@ -1907,6 +1903,7 @@ export default function App() {
   const [mcpServers, setMcpServers] = useState<McpServerConfig[]>(() =>
     loadMcpServers(),
   );
+  const [userStyle, setUserStyle] = useState(() => loadUserStyle());
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("providers");
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -1915,6 +1912,11 @@ export default function App() {
   const activeAgentId = chatState.activeAgentId;
   const conversations = chatState.conversations;
   const activeConversationId = chatState.activeConversationId;
+
+  function handleUserStyleChange(style: string) {
+    setUserStyle(style);
+    saveUserStyle(style);
+  }
 
   function setConversations(
     next:
