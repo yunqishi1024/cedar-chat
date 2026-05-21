@@ -120,8 +120,6 @@ input:disabled {
   height: 100dvh;
   min-height: 100dvh;
   overflow: hidden;
-  padding-top: env(safe-area-inset-top, 47px);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
   background:
     linear-gradient(180deg, rgba(31, 49, 66, 0.16), transparent 34rem),
     var(--bg-primary);
