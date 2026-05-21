@@ -4,18 +4,14 @@ import type { CedarSyncSnapshot } from "./sync";
 import { pullSyncSnapshot, pushSyncSnapshot } from "./sync";
 
 export interface AutoSyncCallbacks {
-  /** Build the current local snapshot */
   createSnapshot: () => CedarSyncSnapshot;
-  /** Merge remote into local and apply */
   mergeAndApply: (local: CedarSyncSnapshot, cloud: CedarSyncSnapshot) => CedarSyncSnapshot;
-  /** Apply merged snapshot to app state */
   applySnapshot: (snapshot: CedarSyncSnapshot) => void;
-  /** Update sync timestamps */
   onSyncComplete: (pushed: boolean, pulled: boolean) => void;
-  /** Report errors (non-blocking) */
   onSyncError?: (error: Error) => void;
-  /** Report status messages */
   onSyncStatus?: (message: string) => void;
+  /** When true, skip sync to avoid interrupting AI streaming */
+  isStreaming: () => boolean;
 }
 
 /**
