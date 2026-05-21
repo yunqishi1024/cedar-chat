@@ -4,14 +4,20 @@ import type { CedarSyncSnapshot } from "./sync";
 import { pullSyncSnapshot, pushSyncSnapshot } from "./sync";
 
 export interface AutoSyncCallbacks {
+  /** Build the current local snapshot */
   createSnapshot: () => CedarSyncSnapshot;
+  /** Merge remote into local and apply */
   mergeAndApply: (local: CedarSyncSnapshot, cloud: CedarSyncSnapshot) => CedarSyncSnapshot;
+  /** Apply merged snapshot to app state */
   applySnapshot: (snapshot: CedarSyncSnapshot) => void;
+  /** Update sync timestamps */
   onSyncComplete: (pushed: boolean, pulled: boolean) => void;
+  /** Report errors (non-blocking) */
   onSyncError?: (error: Error) => void;
+  /** Report status messages */
   onSyncStatus?: (message: string) => void;
-  /** When true, skip sync to avoid interrupting AI streaming */
-  isStreaming: () => boolean;
+  /** Return true if AI is currently streaming — sync will be skipped */
+  isStreaming?: () => boolean;
 }
 
 /**
@@ -36,10 +42,20 @@ export function useAutoSync(
   const settingsRef = useRef(syncSettings);
   settingsRef.current = syncSettings;
 
+  const canSync = useCallback((): boolean => {
+    const s = settingsRef.current;
+    return (
+      s.autoSyncEnabled &&
+      Boolean(s.endpoint.trim()) &&
+      s.syncCode.trim().length >= 8
+    );
+  }, []);
+
   const doSync = useCallback(async () => {
     if (busyRef.current) return;
     if (!canSync()) return;
-    if (callbacksRef.current.isStreaming()) return;
+    // Skip sync while AI is streaming to avoid interruption
+    if (callbacksRef.current.isStreaming?.()) return;
 
     busyRef.current = true;
     const { createSnapshot, mergeAndApply, applySnapshot, onSyncComplete, onSyncError, onSyncStatus } =
@@ -50,9 +66,13 @@ export function useAutoSync(
       onSyncStatus?.("Auto-syncing...");
       const localSnapshot = createSnapshot();
 
-      // 保护：本地没有对话时，只 pull 不 push（防止空数据覆盖云端）
-      if (localSnapshot.conversations.length === 0 || 
-          (localSnapshot.conversations.length === 1 && localSnapshot.conversations[0].messages.length === 0)) {
+      // Guard: if local is empty (no real conversations), only pull — never push empty data
+      const localIsEmpty =
+        localSnapshot.conversations.length === 0 ||
+        (localSnapshot.conversations.length === 1 &&
+          localSnapshot.conversations[0].messages.length === 0);
+
+      if (localIsEmpty) {
         const cloudSnapshot = await pullSyncSnapshot(settings);
         if (cloudSnapshot && cloudSnapshot.conversations.length > 0) {
           applySnapshot(cloudSnapshot);
@@ -62,24 +82,26 @@ export function useAutoSync(
         return;
       }
 
-      // Step 1: Pull first
+      // Step 1: Pull from cloud first
       const cloudSnapshot = await pullSyncSnapshot(settings);
 
-      // Step 2: Merge
+      // Step 2: Merge local + cloud
       const mergedSnapshot = cloudSnapshot
         ? mergeAndApply(localSnapshot, cloudSnapshot)
         : localSnapshot;
 
-      // Step 3: Apply only if cloud had extra content
+      // Step 3: Apply merged result if cloud contributed new content
       if (cloudSnapshot) {
         const localIds = localSnapshot.conversations.map(c => c.id).sort().join(",");
         const mergedIds = mergedSnapshot.conversations.map(c => c.id).sort().join(",");
-        if (localIds !== mergedIds) {
+        const localMsgCount = localSnapshot.conversations.reduce((n, c) => n + c.messages.length, 0);
+        const mergedMsgCount = mergedSnapshot.conversations.reduce((n, c) => n + c.messages.length, 0);
+        if (localIds !== mergedIds || localMsgCount !== mergedMsgCount) {
           applySnapshot(mergedSnapshot);
         }
       }
 
-      // Step 4: Push merged result
+      // Step 4: Push merged result to cloud
       await pushSyncSnapshot(settings, mergedSnapshot);
       onSyncComplete(true, Boolean(cloudSnapshot));
       onSyncStatus?.(null as unknown as string);
@@ -91,7 +113,7 @@ export function useAutoSync(
       busyRef.current = false;
     }
   }, [canSync]);
-  
+
   // Periodic interval
   useEffect(() => {
     if (!syncSettings.autoSyncEnabled) return;
