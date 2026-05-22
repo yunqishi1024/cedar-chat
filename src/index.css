@@ -1703,3 +1703,50 @@ input:disabled {
   font-size: var(--text-xs);
 }
 
+/* ============================================================
+   全屏模式
+   ============================================================ */
+
+.cedar-fullscreen {
+  position: fixed !important;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 9999;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  border: none !important;
+  max-height: none !important;
+  display: flex;
+  flex-direction: column;
+}
+
+.cedar-fullscreen .cedar-artifact-frame {
+  flex: 1;
+  max-height: none;
+  min-height: 0;
+  height: 100%;
+}
+
+.cedar-fullscreen pre {
+  flex: 1;
+  max-height: none;
+  overflow: auto;
+}
+
+.cedar-fullscreen .cedar-artifact-code {
+  flex: 1;
+  max-height: none;
+}
+
+.cedar-fullscreen .cedar-mermaid {
+  flex: 1;
+  overflow: auto;
+}
+
+.cedar-fullscreen .cedar-svg-preview {
+  flex: 1;
+  overflow: auto;
+}
+
