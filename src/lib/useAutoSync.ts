@@ -124,7 +124,7 @@ export function useAutoSync(
     // Run once immediately on enable
     const initialTimeout = setTimeout(() => {
       doSync();
-    }, 2000);
+    }, 500);
 
     const intervalId = setInterval(() => {
       // Only sync when tab is visible to avoid unnecessary network requests
@@ -150,9 +150,7 @@ export function useAutoSync(
     if (!syncSettings.autoSyncEnabled) return;
 
     function handleVisibilityChange() {
-      if (document.visibilityState === "visible") {
-        doSync();
-      }
+      doSync();
     }
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
