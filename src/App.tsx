@@ -4253,20 +4253,7 @@ export default function App() {
                     key={m.id}
                     className={`cedar-context-msg-item ${isPinPoint ? "cedar-context-msg-pinned" : ""}`}
                   >
-                    <button
-                      type="button"
-                      className="cedar-context-msg-btn"
-                      onClick={() => {
-                        const el = document.getElementById(`msg-${m.id}`);
-                        el?.scrollIntoView({ behavior: "smooth", block: "center" });
-                      }}
-                      title={preview}
-                    >
-                      <span className="cedar-context-msg-role">
-                        {m.role === "user" ? "U" : "A"}
-                      </span>
-                      <span className="cedar-context-msg-text">{preview}</span>
-                    </button>
+                    
                     {m.role === "user" && i > 0 && (
                       <button
                         type="button"
@@ -4278,6 +4265,20 @@ export default function App() {
                         📌
                       </button>
                     )}
+                    <span className="cedar-context-msg-role">
+                      {m.role === "user" ? "U" : "A"}
+                    </span>
+                    <button
+                      type="button"
+                      className="cedar-context-msg-btn"
+                      onClick={() => {
+                        const el = document.getElementById(`msg-${m.id}`);
+                        el?.scrollIntoView({ behavior: "smooth", block: "center" });
+                      }}
+                      title={preview}
+                    >
+                      <span className="cedar-context-msg-text">{preview}</span>
+                    </button>
                   </div>
                 );
               })}
