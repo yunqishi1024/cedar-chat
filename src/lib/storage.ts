@@ -177,7 +177,7 @@ const DEFAULT_SYNC_SETTINGS: SyncSettings = {
   lastPushedAt: null,
   lastPulledAt: null,
   autoSyncEnabled: false,         // <-- 新增
-  autoSyncIntervalMs: 30_000,     // <-- 新增，默认30秒
+  autoSyncIntervalMs: 10_000,     // <-- 新增，默认30秒
 };
 
 export function loadPreferences(): Preferences {
