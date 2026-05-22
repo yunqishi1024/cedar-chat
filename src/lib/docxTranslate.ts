@@ -93,7 +93,7 @@ export async function writeTranslatedDocx(
 
   docXml = docXml.replace(
     /<w:t([^>]*)>([\s\S]*?)<\/w:t>/g,
-    (_fullMatch, attrs) => {
+    (_fullMatch: string, attrs: string) => {
       if (textIndex < newTexts.length) {
         const replacement = newTexts[textIndex];
         textIndex++;
