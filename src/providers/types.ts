@@ -117,6 +117,7 @@ export interface ChatAttachment {
   text?: string;
   dataUrl?: string;
   error?: string;
+  file?: File;
 }
 
 export interface AttachmentBlock {
