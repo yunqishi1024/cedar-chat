@@ -128,16 +128,17 @@ function renderMarkdownLines(text: string, blockIndex: number) {
       return;
     }
 
-    // 标题 h1-h6
     const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
-      const level = heading[1].length as 1 | 2 | 3 | 4 | 5 | 6;
-      const Tag = `h${level}` as keyof JSX.IntrinsicElements;
-      nodes.push(
-        <Tag key={`${blockIndex}-h-${index}`}>
-          {renderInlineMarkdown(heading[2])}
-        </Tag>,
-      );
+      const level = heading[1].length;
+      const content = renderInlineMarkdown(heading[2]);
+      const key = `${blockIndex}-h-${index}`;
+      if (level === 1) nodes.push(<h1 key={key}>{content}</h1>);
+      else if (level === 2) nodes.push(<h2 key={key}>{content}</h2>);
+      else if (level === 3) nodes.push(<h3 key={key}>{content}</h3>);
+      else if (level === 4) nodes.push(<h4 key={key}>{content}</h4>);
+      else if (level === 5) nodes.push(<h5 key={key}>{content}</h5>);
+      else nodes.push(<h6 key={key}>{content}</h6>);
       return;
     }
 
