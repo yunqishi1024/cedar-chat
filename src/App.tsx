@@ -13,7 +13,6 @@ import {
   type CSSProperties,
   type ClipboardEvent,
   type DragEvent,
-  type PinnedSummary,
 } from "react";
 import { Settings, type SettingsTab } from "./components/Settings";
 import {
@@ -78,6 +77,7 @@ import {
   type TtsSettings,
   loadUserStyle,
   saveUserStyle,
+  type PinnedSummary,
 } from "./lib/storage";
 import {
   callMcpTool,
@@ -2783,48 +2783,6 @@ export default function App() {
       !activeConversation
     ) return;
 
-    const inputText = input;
-    const attachments = pendingAttachments;
-    const userContent: ContentBlock[] = [
-      ...attachments.map((attachment): ContentBlock => ({
-        type: "attachment",
-        attachment,
-      })),
-      ...(inputText.trim() ? [{ type: "text" as const, text: inputText }] : []),
-    ];
-    const shouldGenerateTitle = activeConversation.messages.length === 0;
-    const now = timestampNow();
-    const userMessage: UIMessage = {
-      id: uid(),
-      role: "user",
-      content: userContent,
-      createdAt: now,
-    };
-    const assistantMessage: UIMessage = {
-      id: uid(),
-      role: "assistant",
-      model: selectedModel,
-      content: [],
-      createdAt: now,
-      streaming: true,
-    };
-
-    const promptMessages = [...messages, userMessage].map(stripTransient);
-    const nextMessages = [...promptMessages, stripTransient(assistantMessage)];
-    const conversationId = activeConversation.id;
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id === conversationId
-          ? {
-              ...c,
-              title: c.messages.length === 0 ? "Summarizing..." : c.title,
-              messages: nextMessages,
-              updatedAt: Date.now(),
-            }
-          : c,
-      ),
-    );
-
 
 
     async function handlePinMessage(messageId: string) {
@@ -2869,6 +2827,55 @@ export default function App() {
       setBusy(false);
     }
   }
+
+
+    
+
+    const inputText = input;
+    const attachments = pendingAttachments;
+    const userContent: ContentBlock[] = [
+      ...attachments.map((attachment): ContentBlock => ({
+        type: "attachment",
+        attachment,
+      })),
+      ...(inputText.trim() ? [{ type: "text" as const, text: inputText }] : []),
+    ];
+    const shouldGenerateTitle = activeConversation.messages.length === 0;
+    const now = timestampNow();
+    const userMessage: UIMessage = {
+      id: uid(),
+      role: "user",
+      content: userContent,
+      createdAt: now,
+    };
+    const assistantMessage: UIMessage = {
+      id: uid(),
+      role: "assistant",
+      model: selectedModel,
+      content: [],
+      createdAt: now,
+      streaming: true,
+    };
+
+    const promptMessages = [...messages, userMessage].map(stripTransient);
+    const nextMessages = [...promptMessages, stripTransient(assistantMessage)];
+    const conversationId = activeConversation.id;
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === conversationId
+          ? {
+              ...c,
+              title: c.messages.length === 0 ? "Summarizing..." : c.title,
+              messages: nextMessages,
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+    );
+
+
+
+
 
 
 
