@@ -13,6 +13,7 @@ import {
   type CSSProperties,
   type ClipboardEvent,
   type DragEvent,
+  type PinnedSummary,
 } from "react";
 import { Settings, type SettingsTab } from "./components/Settings";
 import {
@@ -704,6 +705,44 @@ async function generateConversationTitle(
 
   return normalizeGeneratedTitle(contentBlocksToPlainText(response.content, true));
 }
+
+async function generatePinSummary(
+  provider: ReturnType<typeof createProvider>,
+  model: string,
+  messagesToSummarize: StoredMessage[],
+  existingSummary?: string | null,
+): Promise<string> {
+  const conversationText = messagesToSummarize
+    .map((message) => {
+      const label = message.role === "user" ? "User" : "Assistant";
+      return `${label}: ${contentBlocksToPlainText(message.content, true)}`;
+    })
+    .join("\n\n");
+
+  const contextPrefix = existingSummary
+    ? `Previous summary:\n${existingSummary}\n\nNew messages since last summary:\n`
+    : "";
+
+  const response = await provider.sendMessage({
+    model,
+    maxTokens: 2048,
+    temperature: 0.3,
+    messages: [
+      {
+        role: "user",
+        content:
+          "You are a conversation summarizer. Create a comprehensive but concise summary of the conversation below. " +
+          "Preserve key facts, decisions, code snippets references, and context needed to continue the conversation. " +
+          "Use the conversation's main language. Output only the summary, no preamble.\n\n" +
+          contextPrefix +
+          conversationText.slice(0, 50000),
+      },
+    ],
+  });
+
+  return contentBlocksToPlainText(response.content, true);
+}
+
 
 function assistantBlocksFromText(
   thinkingText: string,
@@ -2335,10 +2374,54 @@ export default function App() {
         claudeCacheAvailable && contextPromptCache !== "off";
       const currentTimeAfterCache =
         contextCacheEnabled && injectCurrentTime;
-      const requestMessages: ChatMessage[] = trimmed.map((m) => ({
-        role: m.role,
-        content: requestContentFromBlocks(m.content),
-      }));
+      
+      // Pin/Summary: 如果有 pinnedSummary，发 [summary pair (cached)] + [post-pin messages]
+      const pinnedSummary = activeConversation?.pinnedSummary;
+      let requestMessages: ChatMessage[];
+
+      if (pinnedSummary && contextCacheEnabled) {
+        const pinIdx = trimmed.findIndex(
+          (m) => m.id === pinnedSummary.pinnedAtMessageId,
+        );
+        const postPinMessages: ChatMessage[] =
+          pinIdx >= 0
+            ? trimmed.slice(pinIdx).map((m) => ({
+                role: m.role,
+                content: requestContentFromBlocks(m.content),
+              }))
+            : trimmed.map((m) => ({
+                role: m.role,
+                content: requestContentFromBlocks(m.content),
+              }));
+
+        const cacheCtrl = cacheControlForTTL(contextPromptCache);
+        const summaryUserMessage: ChatMessage = {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `<conversation-summary>\n${pinnedSummary.text}\n</conversation-summary>\n\nThe above is a summary of our earlier conversation. Continue from here.`,
+              ...(cacheCtrl ? { cache_control: cacheCtrl } : {}),
+            },
+          ],
+        };
+        const summaryAssistantMessage: ChatMessage = {
+          role: "assistant",
+          content: "Understood. I have the context from our earlier conversation. Let's continue.",
+        };
+
+        requestMessages = [
+          summaryUserMessage,
+          summaryAssistantMessage,
+          ...postPinMessages,
+        ];
+      } else {
+        requestMessages = trimmed.map((m) => ({
+          role: m.role,
+          content: requestContentFromBlocks(m.content),
+        }));
+      }
+      
       const finalRequestMessages = currentTimeAfterCache
         ? withCacheControlOnLastMessage(
             requestMessages,
@@ -2741,6 +2824,57 @@ export default function App() {
           : c,
       ),
     );
+
+
+
+    async function handlePinMessage(messageId: string) {
+    if (!currentProvider || !selectedModel || busy || !activeConversation) return;
+
+    const msgIndex = activeConversation.messages.findIndex(
+      (m) => m.id === messageId,
+    );
+    if (msgIndex <= 0) return;
+
+    setBusy(true);
+    try {
+      const provider = createProvider(currentProvider);
+      const messagesToSummarize = activeConversation.messages.slice(0, msgIndex);
+      const existingSummary = activeConversation.pinnedSummary?.text ?? null;
+
+      const summaryText = await generatePinSummary(
+        provider,
+        selectedModel,
+        messagesToSummarize,
+        existingSummary,
+      );
+
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === activeConversation.id
+            ? {
+                ...c,
+                pinnedSummary: {
+                  text: summaryText,
+                  pinnedAtMessageId: messageId,
+                  createdAt: Date.now(),
+                },
+                updatedAt: Date.now(),
+              }
+            : c,
+        ),
+      );
+    } catch (err) {
+      console.error("Pin summary generation failed:", err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+
+
+
+
+    
     // 立即同步写入 localStorage，防止刷新丢消息
     saveConversations(
       conversations.map((c) =>
@@ -3935,6 +4069,56 @@ export default function App() {
               agent {activeAgentPromptCache} · context {activeContextPromptCache}
             </div>
           </section>
+          <section>
+            <div className="cedar-context-label">
+              Messages
+              {activeConversation?.pinnedSummary && (
+                <span style={{ marginLeft: 8, color: "var(--cedar-accent)", fontSize: "var(--text-xs)" }}>
+                  📌 Pinned
+                </span>
+              )}
+            </div>
+            <div className="cedar-context-messages">
+              {messages.map((m, i) => {
+                const isPinPoint =
+                  activeConversation?.pinnedSummary?.pinnedAtMessageId === m.id;
+                const preview =
+                  contentBlocksToPlainText(m.content).slice(0, 60) || "(empty)";
+                return (
+                  <div
+                    key={m.id}
+                    className={`cedar-context-msg-item ${isPinPoint ? "cedar-context-msg-pinned" : ""}`}
+                  >
+                    <button
+                      type="button"
+                      className="cedar-context-msg-btn"
+                      onClick={() => {
+                        const el = document.getElementById(`msg-${m.id}`);
+                        el?.scrollIntoView({ behavior: "smooth", block: "center" });
+                      }}
+                      title={preview}
+                    >
+                      <span className="cedar-context-msg-role">
+                        {m.role === "user" ? "U" : "A"}
+                      </span>
+                      <span className="cedar-context-msg-text">{preview}</span>
+                    </button>
+                    {m.role === "user" && i > 0 && (
+                      <button
+                        type="button"
+                        className="cedar-context-pin-btn"
+                        onClick={() => handlePinMessage(m.id)}
+                        disabled={busy}
+                        title="Pin: summarize everything above"
+                      >
+                        📌
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
         </div>
       </aside>
 
@@ -5017,6 +5201,7 @@ function MessageView({
       : null;
   return (
     <article
+      id={`msg-${message.id}`}
       className={`group cedar-message ${
         isUser ? "message-flora" : "message-cedar"
       } ${message.streaming && !isUser ? "cedar-thinking" : ""}`}
