@@ -4844,11 +4844,11 @@ function ThinkingBlockDetails({
   const [open, setOpen] = useState(initialOpen);
   return (
     <details
-      className="mb-2 text-sm text-neutral-500 dark:text-neutral-400 border-l-2 border-neutral-300 dark:border-neutral-600 pl-3"
+      className="mb-2 text-neutral-500 dark:text-neutral-400 border-l-2 border-neutral-300 dark:border-neutral-600 pl-3"
       open={open}
       onToggle={(event) => setOpen(event.currentTarget.open)}
     >
-      <summary className="cursor-pointer select-none text-xs uppercase tracking-wide">
+      <summary className="cursor-pointer select-none text-sm uppercase tracking-wide">
         thinking
       </summary>
       <div className="whitespace-pre-wrap mt-1">{text}</div>
