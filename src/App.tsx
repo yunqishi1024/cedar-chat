@@ -77,7 +77,6 @@ import {
   type TtsSettings,
   loadUserStyle,
   saveUserStyle,
-  type PinnedSummary,
 } from "./lib/storage";
 import {
   callMcpTool,
@@ -2785,7 +2784,7 @@ export default function App() {
 
 
 
-    async function handlePinMessage(messageId: string) {
+  async function handlePinMessage(messageId: string) {
     if (!currentProvider || !selectedModel || busy || !activeConversation) return;
 
     const msgIndex = activeConversation.messages.findIndex(
