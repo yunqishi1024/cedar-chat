@@ -1,7 +1,7 @@
 // src/components/ArtifactView.tsx
 //
 // Artifact 预览组件 - 代码块智能渲染
-// 支持：HTML预览、React组件预览、Mermaid图表、SVG、普通代码高亮+复制
+// 支持：HTML预览、React组件预览、Mermaid图表、SVG、普通代码高亮+复制+全屏
 
 import { useState, useEffect, useRef } from "react";
 
@@ -26,11 +26,24 @@ function CopyButton({ code }: { code: string }) {
 }
 
 // ============================================================
+// 全屏按钮
+// ============================================================
+
+function FullscreenButton({ isFullscreen, onToggle }: { isFullscreen: boolean; onToggle: () => void }) {
+  return (
+    <button onClick={onToggle} className="cedar-copy-button" title={isFullscreen ? "退出全屏" : "全屏"}>
+      {isFullscreen ? "✕ Exit" : "⛶ Full"}
+    </button>
+  );
+}
+
+// ============================================================
 // HTML 预览
 // ============================================================
 
 function HtmlPreview({ code }: { code: string }) {
   const [showPreview, setShowPreview] = useState(true);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   const srcDoc = code.includes("<html") || code.includes("<!DOCTYPE")
     ? code
@@ -39,7 +52,7 @@ function HtmlPreview({ code }: { code: string }) {
        </head><body>${code}</body></html>`;
 
   return (
-    <div className="cedar-artifact-container">
+    <div className={`cedar-artifact-container ${isFullscreen ? "cedar-fullscreen" : ""}`}>
       <div className="cedar-artifact-header">
         <span className="cedar-code-lang">HTML</span>
         <div className="cedar-artifact-tabs">
@@ -56,6 +69,7 @@ function HtmlPreview({ code }: { code: string }) {
             Code
           </button>
         </div>
+        <FullscreenButton isFullscreen={isFullscreen} onToggle={() => setIsFullscreen(!isFullscreen)} />
         <CopyButton code={code} />
       </div>
       {showPreview ? (
@@ -77,6 +91,7 @@ function HtmlPreview({ code }: { code: string }) {
 
 function ReactPreview({ code }: { code: string }) {
   const [showPreview, setShowPreview] = useState(true);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   // 检测是否有 export default 或 function App / const App
   let entryCode = code;
@@ -110,7 +125,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
 </body></html>`;
 
   return (
-    <div className="cedar-artifact-container">
+    <div className={`cedar-artifact-container ${isFullscreen ? "cedar-fullscreen" : ""}`}>
       <div className="cedar-artifact-header">
         <span className="cedar-code-lang">React</span>
         <div className="cedar-artifact-tabs">
@@ -127,6 +142,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
             Code
           </button>
         </div>
+        <FullscreenButton isFullscreen={isFullscreen} onToggle={() => setIsFullscreen(!isFullscreen)} />
         <CopyButton code={code} />
       </div>
       {showPreview ? (
@@ -150,6 +166,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [showCode, setShowCode] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   useEffect(() => {
     if (!ref.current) return;
@@ -185,7 +202,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
   }, [chart]);
 
   return (
-    <div className="cedar-artifact-container">
+    <div className={`cedar-artifact-container ${isFullscreen ? "cedar-fullscreen" : ""}`}>
       <div className="cedar-artifact-header">
         <span className="cedar-code-lang">Mermaid</span>
         <div className="cedar-artifact-tabs">
@@ -202,6 +219,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
             Code
           </button>
         </div>
+        <FullscreenButton isFullscreen={isFullscreen} onToggle={() => setIsFullscreen(!isFullscreen)} />
         <CopyButton code={chart} />
       </div>
       {showCode ? (
@@ -221,9 +239,10 @@ function MermaidDiagram({ chart }: { chart: string }) {
 
 function SvgPreview({ svg }: { svg: string }) {
   const [showCode, setShowCode] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   return (
-    <div className="cedar-artifact-container">
+    <div className={`cedar-artifact-container ${isFullscreen ? "cedar-fullscreen" : ""}`}>
       <div className="cedar-artifact-header">
         <span className="cedar-code-lang">SVG</span>
         <div className="cedar-artifact-tabs">
@@ -240,6 +259,7 @@ function SvgPreview({ svg }: { svg: string }) {
             Code
           </button>
         </div>
+        <FullscreenButton isFullscreen={isFullscreen} onToggle={() => setIsFullscreen(!isFullscreen)} />
         <CopyButton code={svg} />
       </div>
       {showCode ? (
@@ -252,14 +272,17 @@ function SvgPreview({ svg }: { svg: string }) {
 }
 
 // ============================================================
-// 普通代码块（带高亮+复制）
+// 普通代码块（带高亮+复制+全屏）
 // ============================================================
 
 function CodeBlock({ language, code }: { language: string; code: string }) {
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
   return (
-    <div className="cedar-code-block">
+    <div className={`cedar-code-block ${isFullscreen ? "cedar-fullscreen" : ""}`}>
       <div className="cedar-code-header">
         <span className="cedar-code-lang">{language || "text"}</span>
+        <FullscreenButton isFullscreen={isFullscreen} onToggle={() => setIsFullscreen(!isFullscreen)} />
         <CopyButton code={code} />
       </div>
       <pre><code>{code}</code></pre>
