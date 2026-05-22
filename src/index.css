@@ -845,7 +845,7 @@ input:disabled {
   cursor: pointer;
   border-radius: 4px;
   font-size: 12px;
-  opacity: 0;
+  opacity: 0.5;
   transition: opacity 150ms;
 }
 
