@@ -2785,6 +2785,67 @@ export default function App() {
     }
   }
 
+    function detectDocxTranslateIntent(
+    text: string,
+    attachments: ChatAttachment[],
+  ): { isTranslate: boolean; targetLang: string; docxFile?: File } {
+    const docxAttachment = attachments.find(
+      (a) => a.name?.endsWith(".docx") && a.file,
+    );
+    if (!docxAttachment?.file) return { isTranslate: false, targetLang: "" };
+
+    const lower = text.toLowerCase();
+    const hasIntent =
+      lower.includes("翻译") ||
+      lower.includes("translate") ||
+      lower.includes("转成") ||
+      lower.includes("转为");
+    if (!hasIntent) return { isTranslate: false, targetLang: "" };
+
+    const langPatterns: [RegExp, string][] = [
+      [/英[文语]|english/i, "英文"],
+      [/中[文语]|chinese/i, "中文"],
+      [/日[文语]|japanese/i, "日文"],
+      [/韩[文语]|korean/i, "韩文"],
+      [/法[文语]|french/i, "法文"],
+      [/德[文语]|german/i, "德文"],
+      [/西班牙[文语]|spanish/i, "西班牙文"],
+      [/俄[文语]|russian/i, "俄文"],
+    ];
+
+    let targetLang = "英文";
+    for (const [pattern, lang] of langPatterns) {
+      if (pattern.test(text)) {
+        targetLang = lang;
+        break;
+      }
+    }
+
+    return { isTranslate: true, targetLang, docxFile: docxAttachment.file };
+  }
+
+  function updateAssistantContent(
+    conversationId: string,
+    messageId: string,
+    text: string,
+  ) {
+    setConversations((prev) =>
+      prev.map((c) => {
+        if (c.id !== conversationId) return c;
+        return {
+          ...c,
+          messages: c.messages.map((msg) => {
+            if (msg.id !== messageId) return msg;
+            return { ...msg, content: [{ type: "text" as const, text }] };
+          }),
+        };
+      }),
+    );
+  }
+
+
+  
+
   // --- 发消息 ---
   async function handleSend() {
     if (
@@ -2797,6 +2858,102 @@ export default function App() {
     ) return;
     const inputText = input;
     const attachments = pendingAttachments;
+        // === docx 翻译自动检测 ===
+    const docxTranslateResult = detectDocxTranslateIntent(inputText, attachments);
+    if (docxTranslateResult.isTranslate && docxTranslateResult.docxFile) {
+      setInput("");
+      setPendingAttachments([]);
+      const conversationId = activeConversation.id;
+      const now = timestampNow();
+
+      const userMsg: UIMessage = {
+        id: uid(),
+        role: "user",
+        content: [
+          ...attachments.map(
+            (attachment): ContentBlock => ({ type: "attachment", attachment }),
+          ),
+          ...(inputText.trim()
+            ? [{ type: "text" as const, text: inputText }]
+            : []),
+        ],
+        createdAt: now,
+      };
+
+      const assistantMsg: UIMessage = {
+        id: uid(),
+        role: "assistant",
+        model: selectedModel,
+        content: [{ type: "text", text: "正在解析文档..." }],
+        createdAt: now,
+      };
+
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === conversationId
+            ? {
+                ...c,
+                messages: [
+                  ...c.messages,
+                  stripTransient(userMsg),
+                  stripTransient(assistantMsg),
+                ],
+                updatedAt: Date.now(),
+              }
+            : c,
+        ),
+      );
+
+      try {
+        const { parseDocx, translateParagraphs, writeTranslatedDocx, downloadBlob } =
+          await import("./lib/docxTranslate");
+
+        const parseResult = await parseDocx(docxTranslateResult.docxFile);
+
+        updateAssistantContent(
+          conversationId,
+          assistantMsg.id,
+          `解析完成，共 ${parseResult.paragraphs.length} 段文本，开始翻译为${docxTranslateResult.targetLang}...`,
+        );
+
+        const translated = await translateParagraphs(parseResult.paragraphs, {
+          targetLang: docxTranslateResult.targetLang,
+          baseUrl: currentProvider.baseUrl,
+          apiKey: currentProvider.apiKey,
+          model: selectedModel,
+          onProgress: (done, total) => {
+            updateAssistantContent(
+              conversationId,
+              assistantMsg.id,
+              `翻译进度：${done}/${total} 段...`,
+            );
+          },
+        });
+
+        const blob = await writeTranslatedDocx(parseResult, translated);
+        const filename = `${docxTranslateResult.docxFile.name.replace(/\.docx$/i, "")}_${docxTranslateResult.targetLang}.docx`;
+        downloadBlob(blob, filename);
+
+        updateAssistantContent(
+          conversationId,
+          assistantMsg.id,
+          `翻译完成！已自动下载 **${filename}**\n\n共翻译 ${parseResult.paragraphs.length} 个段落。`,
+        );
+      } catch (err: any) {
+        updateAssistantContent(
+          conversationId,
+          assistantMsg.id,
+          `翻译失败：${err.message}`,
+        );
+      }
+      return;
+    }
+    // === docx 翻译自动检测结束 ===
+
+
+
+    
+
     const userContent: ContentBlock[] = [
       ...attachments.map((attachment): ContentBlock => ({
         type: "attachment",
