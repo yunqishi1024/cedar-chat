@@ -5,6 +5,9 @@
 // 2. UI 查询 capability 表决定显示哪些控件（temperature 滑块 vs reasoning effort）
 // 3. 流式消息：assistant 消息边收边渲染，thinking 和 text 分开显示
 
+import { MarkdownText } from "./components/MarkdownText";
+import { DocxTranslator } from "./components/DocxTranslator";
+
 import {
   useEffect,
   useMemo,
@@ -5346,89 +5349,4 @@ function MessageView({
   );
 }
 
-function MarkdownText({ text }: { text: string }) {
-  const blocks = text.split(/```/);
 
-  return (
-    <div className="markdown-body">
-      {blocks.map((block, index) => {
-        if (index % 2 === 1) {
-          const lines = block.replace(/^\n/, "").split("\n");
-          const maybeLang = lines[0]?.trim() ?? "";
-          const hasLang = /^[\w#+.-]+$/.test(maybeLang);
-          const code = (hasLang ? lines.slice(1) : lines).join("\n").trimEnd();
-
-          return (
-            <pre key={index}>
-              <code>{code}</code>
-            </pre>
-          );
-        }
-
-        return renderMarkdownLines(block, index);
-      })}
-    </div>
-  );
-}
-
-function renderMarkdownLines(text: string, blockIndex: number) {
-  const lines = text.split("\n");
-  const nodes: React.ReactNode[] = [];
-  let listItems: string[] = [];
-
-  function flushList(key: string) {
-    if (listItems.length === 0) return;
-    nodes.push(
-      <ul key={key}>
-        {listItems.map((item, index) => (
-          <li key={index}>{renderInlineMarkdown(item)}</li>
-        ))}
-      </ul>,
-    );
-    listItems = [];
-  }
-
-  lines.forEach((line, index) => {
-    const trimmed = line.trim();
-    const listMatch = trimmed.match(/^[-*]\s+(.+)$/);
-
-    if (listMatch) {
-      listItems.push(listMatch[1]);
-      return;
-    }
-
-    flushList(`${blockIndex}-list-${index}`);
-
-    if (!trimmed) {
-      nodes.push(<div key={`${blockIndex}-blank-${index}`} className="h-2" />);
-      return;
-    }
-
-    const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
-    if (heading) {
-      const Tag = `h${heading[1].length}` as "h1" | "h2" | "h3";
-      nodes.push(
-        <Tag key={`${blockIndex}-heading-${index}`}>
-          {renderInlineMarkdown(heading[2])}
-        </Tag>,
-      );
-      return;
-    }
-
-    nodes.push(
-      <p key={`${blockIndex}-p-${index}`}>{renderInlineMarkdown(line)}</p>,
-    );
-  });
-
-  flushList(`${blockIndex}-list-end`);
-  return nodes;
-}
-
-function renderInlineMarkdown(text: string) {
-  return text.split(/(`[^`]+`)/g).map((part, index) => {
-    if (part.startsWith("`") && part.endsWith("`")) {
-      return <code key={index}>{part.slice(1, -1)}</code>;
-    }
-    return <span key={index}>{part}</span>;
-  });
-}
