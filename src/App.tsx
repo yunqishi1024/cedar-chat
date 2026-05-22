@@ -2741,6 +2741,19 @@ export default function App() {
           : c,
       ),
     );
+    // 立即同步写入 localStorage，防止刷新丢消息
+    saveConversations(
+      conversations.map((c) =>
+        c.id === conversationId
+          ? {
+              ...c,
+              title: c.messages.length === 0 ? "Summarizing..." : c.title,
+              messages: nextMessages,
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+    );
     setInput("");
     setPendingAttachments([]);
     setAttachmentError(null);
