@@ -85,6 +85,12 @@ export interface Agent {
   updatedAt: number;
 }
 
+export interface PinnedSummary {
+  text: string;
+  pinnedAtMessageId: string;
+  createdAt: number;
+}
+
 export interface Conversation {
   id: string;
   agentId?: string | null;
@@ -104,6 +110,7 @@ export interface Conversation {
   voiceMessagesEnabled: boolean;
   voiceMessageBudgetTokens: number;
   title: string;
+  pinnedSummary?: PinnedSummary | null;
   messages: StoredMessage[];
   createdAt: number;
   updatedAt: number;
