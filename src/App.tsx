@@ -2474,7 +2474,7 @@ export default function App() {
         }
 
         if (toolCalls.length === 0) {
-          if (round === 0 && chatTools.length > 0 && !textBuf.trim()) {
+          if (round === 0 && chatTools.length > 0 && !textBuf.trim() && !thinkingBuf.trim()) {
             textBuf +=
               "\n\nError: the model ended before returning text or an MCP tool call. Try a tool-calling model, or disable Thinking for this chat and retry.";
           }
