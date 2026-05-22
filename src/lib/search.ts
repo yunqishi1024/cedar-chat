@@ -2,7 +2,6 @@
 // Searches across all conversations' messages for matching text
 
 import type { ContentBlock } from "../providers";
-import type { Conversation, StoredMessage } from "./storage";
 
 export interface SearchResult {
   conversationId: string;
