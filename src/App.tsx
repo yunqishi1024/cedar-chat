@@ -6,7 +6,6 @@
 // 3. 流式消息：assistant 消息边收边渲染，thinking 和 text 分开显示
 
 import { MarkdownText } from "./components/MarkdownText";
-import { DocxTranslator } from "./components/DocxTranslator";
 
 import {
   useEffect,
