@@ -2781,9 +2781,85 @@ export default function App() {
       attaching ||
       !activeConversation
     ) return;
+    const inputText = input;
+    const attachments = pendingAttachments;
+    const userContent: ContentBlock[] = [
+      ...attachments.map((attachment): ContentBlock => ({
+        type: "attachment",
+        attachment,
+      })),
+      ...(inputText.trim() ? [{ type: "text" as const, text: inputText }] : []),
+    ];
+    const shouldGenerateTitle = activeConversation.messages.length === 0;
+    const now = timestampNow();
+    const userMessage: UIMessage = {
+      id: uid(),
+      role: "user",
+      content: userContent,
+      createdAt: now,
+    };
+    const assistantMessage: UIMessage = {
+      id: uid(),
+      role: "assistant",
+      model: selectedModel,
+      content: [],
+      createdAt: now,
+      streaming: true,
+    };
 
+    const promptMessages = [...messages, userMessage].map(stripTransient);
+    const nextMessages = [...promptMessages, stripTransient(assistantMessage)];
+    const conversationId = activeConversation.id;
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === conversationId
+          ? {
+              ...c,
+              title: c.messages.length === 0 ? "Summarizing..." : c.title,
+              messages: nextMessages,
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+    );
 
+    // 立即同步写入 localStorage，防止刷新丢消息
+    saveConversations(
+      conversations.map((c) =>
+        c.id === conversationId
+          ? {
+              ...c,
+              title: c.messages.length === 0 ? "Summarizing..." : c.title,
+              messages: nextMessages,
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+    );
+    setInput("");
+    setPendingAttachments([]);
+    setAttachmentError(null);
+    await runAssistantStream(
+      conversationId,
+      promptMessages,
+      assistantMessage,
+      requestSystemContent(
+        activeConversationAgent,
+        activeAgentPromptCache,
+        claudeCacheAvailable,
+        activeConversation.injectCurrentTime,
+        activeContextPromptCache,
+        multiMessageEnabled,
+        voiceMessagesEnabled && ttsVoiceMessagesAvailable,
+        voiceMessageBudgetTokens,
+      ),
+      activeContextPromptCache,
+      activeConversation.injectCurrentTime,
+      shouldGenerateTitle,
+    );
+  }
 
+  
   async function handlePinMessage(messageId: string) {
     if (!currentProvider || !selectedModel || busy || !activeConversation) return;
 
@@ -2827,95 +2903,7 @@ export default function App() {
     }
   }
 
-
-    
-
-    const inputText = input;
-    const attachments = pendingAttachments;
-    const userContent: ContentBlock[] = [
-      ...attachments.map((attachment): ContentBlock => ({
-        type: "attachment",
-        attachment,
-      })),
-      ...(inputText.trim() ? [{ type: "text" as const, text: inputText }] : []),
-    ];
-    const shouldGenerateTitle = activeConversation.messages.length === 0;
-    const now = timestampNow();
-    const userMessage: UIMessage = {
-      id: uid(),
-      role: "user",
-      content: userContent,
-      createdAt: now,
-    };
-    const assistantMessage: UIMessage = {
-      id: uid(),
-      role: "assistant",
-      model: selectedModel,
-      content: [],
-      createdAt: now,
-      streaming: true,
-    };
-
-    const promptMessages = [...messages, userMessage].map(stripTransient);
-    const nextMessages = [...promptMessages, stripTransient(assistantMessage)];
-    const conversationId = activeConversation.id;
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id === conversationId
-          ? {
-              ...c,
-              title: c.messages.length === 0 ? "Summarizing..." : c.title,
-              messages: nextMessages,
-              updatedAt: Date.now(),
-            }
-          : c,
-      ),
-    );
-
-
-
-
-
-
-
-
-
-    
-    // 立即同步写入 localStorage，防止刷新丢消息
-    saveConversations(
-      conversations.map((c) =>
-        c.id === conversationId
-          ? {
-              ...c,
-              title: c.messages.length === 0 ? "Summarizing..." : c.title,
-              messages: nextMessages,
-              updatedAt: Date.now(),
-            }
-          : c,
-      ),
-    );
-    setInput("");
-    setPendingAttachments([]);
-    setAttachmentError(null);
-    await runAssistantStream(
-      conversationId,
-      promptMessages,
-      assistantMessage,
-      requestSystemContent(
-        activeConversationAgent,
-        activeAgentPromptCache,
-        claudeCacheAvailable,
-        activeConversation.injectCurrentTime,
-        activeContextPromptCache,
-        multiMessageEnabled,
-        voiceMessagesEnabled && ttsVoiceMessagesAvailable,
-        voiceMessageBudgetTokens,
-      ),
-      activeContextPromptCache,
-      activeConversation.injectCurrentTime,
-      shouldGenerateTitle,
-    );
-  }
+  
 
   function handleStop() {
     abortRef.current?.abort();
