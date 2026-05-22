@@ -2664,6 +2664,14 @@ export default function App() {
           ];
         }
 
+        // 将本轮之前的旧 tool results 替换为 [已处理]，节省下一轮的 token
+        const currentRoundToolIds = new Set(toolCalls.map((tc) => tc.id));
+        modelMessages = modelMessages.map((msg) =>
+          msg.role === "tool" && !currentRoundToolIds.has(msg.tool_call_id)
+            ? { ...msg, content: "[已处理]" }
+            : msg,
+        );
+
         if (round === MAX_MCP_TOOL_ROUNDS - 1) {
           stoppedByToolRoundLimit = true;
         }
