@@ -2520,6 +2520,7 @@ export default function App() {
             : undefined,
         tools: chatTools.length > 0 ? chatTools : undefined,
         toolChoice: chatTools.length > 0 ? ("auto" as const) : undefined,
+        maxTokens: 16384,
         signal: controller.signal,
       };
 
