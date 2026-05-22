@@ -143,6 +143,19 @@ export async function attachmentFromFile(file: File): Promise<ChatAttachment> {
     }
   }
 
+// 特殊处理 .docx：保留原始 File 引用供翻译功能使用
+if (file.name.endsWith(".docx")) {
+  return {
+    ...base,
+    file,
+  } as ChatAttachment;
+}
+
+return {
+  ...base,
+  error: "This file type can be attached for reference, but Cedar Chat cannot read its contents yet.",
+};
+
   return {
     ...base,
     error: "This file type can be attached for reference, but Cedar Chat cannot read its contents yet.",
