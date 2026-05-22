@@ -798,6 +798,8 @@ input:disabled {
 
 .cedar-context-msg-btn {
   flex: 1;
+  overflow: hidden;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -831,6 +833,7 @@ input:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+  max-width: calc(100% - 50px);
 }
 
 .cedar-context-pin-btn {
