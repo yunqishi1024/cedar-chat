@@ -4088,7 +4088,7 @@ export default function App() {
                 const isPinPoint =
                   activeConversation?.pinnedSummary?.pinnedAtMessageId === m.id;
                 const preview =
-                  contentBlocksToPlainText(m.content).slice(0, 60) || "(empty)";
+                  contentBlocksToPlainText(m.content).slice(0, 25) || "(empty)";
                 return (
                   <div
                     key={m.id}
