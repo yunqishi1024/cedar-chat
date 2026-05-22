@@ -1162,3 +1162,277 @@ input:disabled {
     font-size: max(16px, calc(var(--cedar-chat-font-size) * 0.94));
   }
 }
+
+/*
+ * cedar-chat-upgrade-styles.css
+ *
+ * 把这些样式追加到你项目的 src/index.css 文件末尾
+ */
+
+/* ============================================================
+   Markdown 增强样式
+   ============================================================ */
+
+.markdown-body strong {
+  color: var(--cedar-50);
+  font-weight: 700;
+}
+
+.markdown-body em {
+  font-style: italic;
+  color: var(--text-primary);
+}
+
+.markdown-body del {
+  text-decoration: line-through;
+  color: var(--text-tertiary);
+}
+
+.markdown-body a {
+  color: var(--river-300);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-body a:hover {
+  color: var(--cedar-100);
+}
+
+.markdown-body ol {
+  margin: var(--space-3) 0;
+  padding-left: var(--space-6);
+  list-style-type: decimal;
+}
+
+.markdown-body blockquote {
+  margin: var(--space-3) 0;
+  padding: var(--space-2) var(--space-4);
+  border-left: 3px solid var(--cedar-500);
+  background: rgba(138, 74, 89, 0.06);
+  color: var(--text-secondary);
+}
+
+.markdown-body blockquote p {
+  margin: var(--space-1) 0;
+}
+
+.markdown-body hr {
+  margin: var(--space-4) 0;
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* ============================================================
+   代码块 + 复制按钮
+   ============================================================ */
+
+.cedar-code-block {
+  position: relative;
+  margin: var(--space-3) 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-overlay);
+  overflow: hidden;
+}
+
+.cedar-code-block pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  padding: var(--space-3);
+  overflow-x: auto;
+}
+
+.cedar-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-1) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+}
+
+.cedar-code-lang {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: lowercase;
+}
+
+.cedar-copy-button {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 2px var(--space-2);
+  font-family: var(--font-en-ui);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.cedar-copy-button:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* ============================================================
+   Artifact 预览容器（HTML/React/Mermaid/SVG）
+   ============================================================ */
+
+.cedar-artifact-container {
+  margin: var(--space-3) 0;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.cedar-artifact-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+}
+
+.cedar-artifact-tabs {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  margin-right: var(--space-2);
+}
+
+.cedar-artifact-tab {
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  padding: 2px var(--space-2);
+  font-family: var(--font-en-ui);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: all 100ms ease;
+}
+
+.cedar-artifact-tab:hover {
+  color: var(--text-secondary);
+}
+
+.cedar-artifact-tab.active {
+  border-color: var(--border-default);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.cedar-artifact-frame {
+  display: block;
+  width: 100%;
+  min-height: 200px;
+  max-height: 500px;
+  border: 0;
+  background: #ffffff;
+  resize: vertical;
+  overflow: auto;
+}
+
+.cedar-artifact-code {
+  margin: 0;
+  padding: var(--space-3);
+  overflow-x: auto;
+  background: var(--bg-overlay);
+  max-height: 400px;
+}
+
+.cedar-artifact-code code {
+  background: transparent;
+  color: var(--text-primary);
+  padding: 0;
+}
+
+.cedar-mermaid {
+  padding: var(--space-4);
+  background: var(--bg-overlay);
+  text-align: center;
+  min-height: 100px;
+}
+
+.cedar-mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.cedar-svg-preview {
+  padding: var(--space-4);
+  background: var(--bg-overlay);
+  text-align: center;
+}
+
+.cedar-svg-preview svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ============================================================
+   Word 文档翻译组件
+   ============================================================ */
+
+.cedar-docx-translator {
+  margin: var(--space-3) 0;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+
+.cedar-docx-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-tertiary);
+}
+
+.cedar-docx-title {
+  color: var(--text-primary);
+  font-family: var(--font-en-ui);
+  font-size: var(--text-sm);
+  font-weight: 650;
+}
+
+.cedar-docx-body {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+
+.cedar-docx-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.cedar-docx-label {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+.cedar-docx-filename {
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cedar-docx-progress {
+  color: var(--cedar-green);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
