@@ -1,7 +1,7 @@
 // Cedar Chat Service Worker
 // Provides offline caching for the PWA shell
 
-const CACHE_NAME = "cedar-chat-v1";
+const CACHE_NAME = "cedar-chat-v2";
 
 // App shell files to precache
 const SHELL_FILES = ["/", "/index.html"];

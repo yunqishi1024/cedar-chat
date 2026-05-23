@@ -1,5 +1,5 @@
-// Cross-conversation search utility
-// Searches across all conversations' messages for matching text
+// Cross-conversation search utility.
+// The UI and built-in model tool share this so results stay consistent.
 
 import type { ContentBlock } from "../providers";
 import type { Conversation } from "./storage";
@@ -9,6 +9,7 @@ export interface SearchResult {
   conversationTitle: string;
   messageId: string;
   messageRole: "user" | "assistant";
+  messageIndex: number;
   matchText: string; // snippet containing the match
   createdAt: number;
 }
@@ -23,11 +24,41 @@ function contentBlocksToSearchText(content: ContentBlock[]): string {
       if (block.type === "thinking") return block.text;
       if (block.type === "voice") return block.text;
       if (block.type === "tool") return [block.input, block.output].filter(Boolean).join(" ");
-      if (block.type === "attachment") return block.attachment.name;
+      if (block.type === "attachment") {
+        return [block.attachment.name, block.attachment.text, block.attachment.error]
+          .filter(Boolean)
+          .join(" ");
+      }
       return "";
     })
     .filter(Boolean)
     .join(" ");
+}
+
+function normalizeSearchText(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function queryTokens(query: string): string[] {
+  return normalizeSearchText(query)
+    .split(" ")
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function matchIndexForQuery(text: string, query: string): number {
+  const normalizedText = normalizeSearchText(text);
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) return -1;
+
+  const phraseIndex = normalizedText.indexOf(normalizedQuery);
+  if (phraseIndex !== -1) return phraseIndex;
+
+  const tokens = queryTokens(query);
+  if (tokens.length === 0) return -1;
+  const tokenIndexes = tokens.map((token) => normalizedText.indexOf(token));
+  if (tokenIndexes.some((index) => index === -1)) return -1;
+  return Math.min(...tokenIndexes);
 }
 
 /**
@@ -59,10 +90,9 @@ export function searchConversations(
   const results: SearchResult[] = [];
 
   for (const conversation of conversations) {
-    for (const message of conversation.messages) {
+    for (const [messageIndex, message] of conversation.messages.entries()) {
       const text = contentBlocksToSearchText(message.content);
-      const lowerText = text.toLowerCase();
-      const matchIndex = lowerText.indexOf(trimmed);
+      const matchIndex = matchIndexForQuery(text, trimmed);
 
       if (matchIndex !== -1) {
         results.push({
@@ -70,19 +100,17 @@ export function searchConversations(
           conversationTitle: conversation.title,
           messageId: message.id,
           messageRole: message.role,
+          messageIndex,
           matchText: createSnippet(text, matchIndex),
           createdAt: message.createdAt ?? conversation.updatedAt,
         });
       }
-
-      if (results.length >= maxResults) break;
     }
-    if (results.length >= maxResults) break;
   }
 
   // Sort by most recent first
   results.sort((a, b) => b.createdAt - a.createdAt);
-  return results;
+  return results.slice(0, maxResults);
 }
 
 /**
@@ -96,6 +124,6 @@ export function searchConversationTitles(
   if (!trimmed) return conversations;
 
   return conversations.filter(
-    (c) => c.title.toLowerCase().includes(trimmed),
+    (c) => matchIndexForQuery(c.title, trimmed) !== -1,
   );
 }

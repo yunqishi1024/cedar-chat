@@ -204,7 +204,7 @@ function parseTranslationResponse(content: string, originalBatch: string[]): str
     } catch { /* fallthrough */ }
   }
 
-  const lines = content.split("\n").map((l) => l.replace(/^\d+[\.\)]\s*/, "").trim()).filter(Boolean);
+  const lines = content.split("\n").map((l) => l.replace(/^\d+[.)]\s*/, "").trim()).filter(Boolean);
   if (lines.length === originalBatch.length) return lines;
 
   console.warn("翻译结果解析失败，保留原文");

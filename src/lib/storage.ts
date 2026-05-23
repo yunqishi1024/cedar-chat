@@ -104,6 +104,8 @@ export interface Conversation {
   agentPromptCache: ClaudePromptCacheTTL;
   contextPromptCache: ClaudePromptCacheTTL;
   claudePromptCache?: ClaudePromptCacheMode;
+  summaryProviderId?: string | null;
+  summaryModel?: string | null;
   showMessageTimestamps: boolean;
   injectCurrentTime: boolean;
   multiMessageEnabled: boolean;
@@ -183,8 +185,8 @@ const DEFAULT_SYNC_SETTINGS: SyncSettings = {
   deviceName: "",
   lastPushedAt: null,
   lastPulledAt: null,
-  autoSyncEnabled: false,         // <-- 新增
-  autoSyncIntervalMs: 10_000,     // <-- 新增，默认30秒
+  autoSyncEnabled: false,
+  autoSyncIntervalMs: 10_000,
 };
 
 export function loadPreferences(): Preferences {
@@ -333,9 +335,12 @@ function normalizeTtsProvider(value: unknown): TtsProviderKind {
 
 function normalizeSyncSettings(value: unknown): SyncSettings {
   if (!isRecord(value)) return DEFAULT_SYNC_SETTINGS;
+  const endpoint = stringValue(value.endpoint);
+  const syncCode = stringValue(value.syncCode);
+  const canSync = Boolean(endpoint.trim() && syncCode.trim().length >= 8);
   return {
-    endpoint: stringValue(value.endpoint),
-    syncCode: stringValue(value.syncCode),
+    endpoint,
+    syncCode,
     deviceName: stringValue(value.deviceName),
     lastPushedAt:
       typeof value.lastPushedAt === "number" && Number.isFinite(value.lastPushedAt)
@@ -346,12 +351,12 @@ function normalizeSyncSettings(value: unknown): SyncSettings {
         ? value.lastPulledAt
         : null,
     autoSyncEnabled:
-      typeof value.autoSyncEnabled === "boolean" ? value.autoSyncEnabled : false,
+      typeof value.autoSyncEnabled === "boolean" ? value.autoSyncEnabled : canSync,
     autoSyncIntervalMs:
       typeof value.autoSyncIntervalMs === "number" &&
       Number.isFinite(value.autoSyncIntervalMs)
         ? Math.max(10_000, Math.min(600_000, Math.round(value.autoSyncIntervalMs)))
-        : 30_000,
+        : DEFAULT_SYNC_SETTINGS.autoSyncIntervalMs,
   };
 }
 
@@ -492,8 +497,12 @@ function stripTransientConversationState(conversation: Conversation): Conversati
   return {
     ...conversation,
     messages: conversation.messages.map((message) => ({
-      ...message,
+      id: message.id,
+      role: message.role,
+      model: message.model,
       content: stripTransientContentBlocks(message.content),
+      createdAt: message.createdAt,
+      usage: message.usage,
     })),
   };
 }

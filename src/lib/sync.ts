@@ -30,11 +30,53 @@ export interface PushSyncResult {
   bytes?: number;
 }
 
+interface SyncObjectRef {
+  key: string;
+  hash: string;
+}
+
+interface ConversationManifestEntry {
+  id: string;
+  updatedAt: number;
+  meta: SyncObjectRef;
+  messages: SyncObjectRef[];
+}
+
+interface CedarSyncV2Manifest {
+  app: "cedar-chat-sync-v2";
+  version: 1;
+  updatedAt: string;
+  deviceName?: string;
+  current: SyncObjectRef;
+  preferences: SyncObjectRef;
+  providers: SyncObjectRef;
+  mcpServers: SyncObjectRef;
+  ttsSettings: SyncObjectRef;
+  agents: SyncObjectRef[];
+  activeAgentId: string | null;
+  conversations: ConversationManifestEntry[];
+  activeConversationId: string | null;
+}
+
 export interface CedarSyncBlobRef {
   id: string;
   mime: string;
   size: number;
   createdAt?: string;
+}
+
+export function syncSnapshotDataSignature(snapshot: CedarSyncSnapshot): string {
+  return JSON.stringify({
+    current: snapshot.current,
+    preferences: snapshot.preferences,
+    providers: snapshot.providers,
+    mcpServers: snapshot.mcpServers,
+    ttsSettings: snapshot.ttsSettings,
+    agents: snapshot.agents,
+    activeAgentId: snapshot.activeAgentId,
+    conversations: snapshot.conversations,
+    activeConversationId: snapshot.activeConversationId,
+  });
 }
 
 interface EncryptedSyncEnvelope {
@@ -44,11 +86,26 @@ interface EncryptedSyncEnvelope {
   algorithm: "AES-GCM";
   kdf: "PBKDF2-SHA256";
   iterations: number;
+  compression?: "gzip";
   salt: string;
   iv: string;
   data: string;
   exportedAt: string;
   deviceName?: string;
+}
+
+interface EncryptedSyncObjectEnvelope {
+  app: "cedar-chat-sync-object";
+  version: 1;
+  encrypted: true;
+  algorithm: "AES-GCM";
+  kdf: "PBKDF2-SHA256";
+  iterations: number;
+  compression?: "gzip";
+  salt: string;
+  iv: string;
+  data: string;
+  createdAt: string;
 }
 
 interface EncryptedBlobEnvelope {
@@ -71,6 +128,18 @@ const SYNC_KDF_ITERATIONS = 120_000;
 function snapshotUrl(endpoint: string): string {
   const url = syncBaseUrl(endpoint);
   url.pathname = `${url.pathname}/snapshot`;
+  return url.toString();
+}
+
+function syncV2Url(endpoint: string, path: string): string {
+  const url = syncBaseUrl(endpoint);
+  url.pathname = `${url.pathname}/v2${path}`;
+  return url.toString();
+}
+
+function syncV2ObjectUrl(endpoint: string, key: string): string {
+  const url = new URL(syncV2Url(endpoint, "/object"));
+  url.searchParams.set("key", key);
   return url.toString();
 }
 
@@ -136,6 +205,53 @@ function bytesToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   ) as ArrayBuffer;
 }
 
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function transformBytes(
+  bytes: Uint8Array,
+  transformer: CompressionStream | DecompressionStream,
+): Promise<Uint8Array> {
+  const stream = new Blob([bytesToArrayBuffer(bytes)])
+    .stream()
+    .pipeThrough(transformer);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function compressSnapshotBytes(
+  bytes: Uint8Array,
+): Promise<{ bytes: Uint8Array; compression?: "gzip" }> {
+  if (typeof CompressionStream === "undefined") return { bytes };
+
+  try {
+    const compressed = await transformBytes(bytes, new CompressionStream("gzip"));
+    return compressed.byteLength < bytes.byteLength
+      ? { bytes: compressed, compression: "gzip" }
+      : { bytes };
+  } catch {
+    return { bytes };
+  }
+}
+
+async function decompressSnapshotBytes(
+  bytes: Uint8Array,
+  compression: EncryptedSyncEnvelope["compression"],
+): Promise<Uint8Array> {
+  if (!compression) return bytes;
+  if (compression !== "gzip") {
+    throw new Error("Cloud copy uses an unsupported compression format.");
+  }
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("This browser cannot decompress the cloud copy.");
+  }
+  return transformBytes(bytes, new DecompressionStream("gzip"));
+}
+
 async function deriveSyncKey(
   syncCode: string,
   salt: Uint8Array,
@@ -170,10 +286,11 @@ async function encryptSnapshot(
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveSyncKey(syncCode, salt, SYNC_KDF_ITERATIONS);
   const plaintext = new TextEncoder().encode(JSON.stringify(snapshot));
+  const compressed = await compressSnapshotBytes(plaintext);
   const encrypted = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv: bytesToArrayBuffer(iv) },
     key,
-    plaintext,
+    bytesToArrayBuffer(compressed.bytes),
   );
 
   return {
@@ -183,11 +300,42 @@ async function encryptSnapshot(
     algorithm: "AES-GCM",
     kdf: "PBKDF2-SHA256",
     iterations: SYNC_KDF_ITERATIONS,
+    ...(compressed.compression ? { compression: compressed.compression } : {}),
     salt: bytesToBase64(salt),
     iv: bytesToBase64(iv),
     data: bytesToBase64(new Uint8Array(encrypted)),
     exportedAt: snapshot.exportedAt,
     ...(snapshot.deviceName ? { deviceName: snapshot.deviceName } : {}),
+  };
+}
+
+async function encryptSyncObject(
+  value: unknown,
+  syncCode: string,
+): Promise<EncryptedSyncObjectEnvelope> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveSyncKey(syncCode, salt, SYNC_KDF_ITERATIONS);
+  const plaintext = new TextEncoder().encode(JSON.stringify(value));
+  const compressed = await compressSnapshotBytes(plaintext);
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: bytesToArrayBuffer(iv) },
+    key,
+    bytesToArrayBuffer(compressed.bytes),
+  );
+
+  return {
+    app: "cedar-chat-sync-object",
+    version: 1,
+    encrypted: true,
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA256",
+    iterations: SYNC_KDF_ITERATIONS,
+    ...(compressed.compression ? { compression: compressed.compression } : {}),
+    salt: bytesToBase64(salt),
+    iv: bytesToBase64(iv),
+    data: bytesToBase64(new Uint8Array(encrypted)),
+    createdAt: new Date().toISOString(),
   };
 }
 
@@ -237,6 +385,24 @@ function isEncryptedEnvelope(value: unknown): value is EncryptedSyncEnvelope {
   );
 }
 
+function isEncryptedSyncObjectEnvelope(
+  value: unknown,
+): value is EncryptedSyncObjectEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.app === "cedar-chat-sync-object" &&
+    record.version === 1 &&
+    record.encrypted === true &&
+    record.algorithm === "AES-GCM" &&
+    record.kdf === "PBKDF2-SHA256" &&
+    typeof record.iterations === "number" &&
+    typeof record.salt === "string" &&
+    typeof record.iv === "string" &&
+    typeof record.data === "string"
+  );
+}
+
 function isEncryptedBlobEnvelope(value: unknown): value is EncryptedBlobEnvelope {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
@@ -270,9 +436,51 @@ async function decryptSnapshot(
       key,
       bytesToArrayBuffer(data),
     );
-    return JSON.parse(new TextDecoder().decode(decrypted)) as CedarSyncSnapshot;
-  } catch {
+    const plaintext = await decompressSnapshotBytes(
+      new Uint8Array(decrypted),
+      envelope.compression,
+    );
+    return JSON.parse(new TextDecoder().decode(plaintext)) as CedarSyncSnapshot;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.includes("compression") ||
+        error.message.includes("decompress"))
+    ) {
+      throw error;
+    }
     throw new Error("Could not decrypt cloud copy. Check the sync code.");
+  }
+}
+
+async function decryptSyncObject<T>(
+  envelope: EncryptedSyncObjectEnvelope,
+  syncCode: string,
+): Promise<T> {
+  try {
+    const salt = base64ToBytes(envelope.salt);
+    const iv = base64ToBytes(envelope.iv);
+    const data = base64ToBytes(envelope.data);
+    const key = await deriveSyncKey(syncCode, salt, envelope.iterations);
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: bytesToArrayBuffer(iv) },
+      key,
+      bytesToArrayBuffer(data),
+    );
+    const plaintext = await decompressSnapshotBytes(
+      new Uint8Array(decrypted),
+      envelope.compression,
+    );
+    return JSON.parse(new TextDecoder().decode(plaintext)) as T;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.includes("compression") ||
+        error.message.includes("decompress"))
+    ) {
+      throw error;
+    }
+    throw new Error("Could not decrypt cloud object. Check the sync code.");
   }
 }
 
@@ -317,10 +525,308 @@ async function responseError(response: Response): Promise<Error> {
   }
 }
 
+async function incrementalSyncAvailable(
+  settings: SyncSettings,
+): Promise<boolean> {
+  try {
+    const response = await fetch(syncV2Url(settings.endpoint, "/health"), {
+      method: "GET",
+      headers: {
+        ...authHeaders(settings),
+        Accept: "application/json",
+      },
+    });
+    if (!response.ok) return false;
+    const payload = (await response.json().catch(() => null)) as
+      | { ok?: boolean; version?: number }
+      | null;
+    return payload?.ok === true && payload.version === 2;
+  } catch {
+    return false;
+  }
+}
+
+async function pullEncryptedSyncObject<T>(
+  settings: SyncSettings,
+  ref: SyncObjectRef,
+): Promise<T> {
+  const response = await fetch(syncV2ObjectUrl(settings.endpoint, ref.key), {
+    method: "GET",
+    headers: {
+      ...authHeaders(settings),
+      Accept: "application/json",
+    },
+  });
+  if (!response.ok) throw await responseError(response);
+
+  const payload = (await response.json()) as unknown;
+  if (!isEncryptedSyncObjectEnvelope(payload)) {
+    throw new Error(`Cloud object ${ref.key} has an unknown format.`);
+  }
+  return decryptSyncObject<T>(payload, settings.syncCode.trim());
+}
+
+async function pullIncrementalManifest(
+  settings: SyncSettings,
+): Promise<CedarSyncV2Manifest | null> {
+  const response = await fetch(syncV2Url(settings.endpoint, "/manifest"), {
+    method: "GET",
+    headers: {
+      ...authHeaders(settings),
+      Accept: "application/json",
+    },
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw await responseError(response);
+
+  const payload = (await response.json()) as unknown;
+  if (!isEncryptedSyncObjectEnvelope(payload)) {
+    throw new Error("Cloud manifest has an unknown format.");
+  }
+  return decryptSyncObject<CedarSyncV2Manifest>(
+    payload,
+    settings.syncCode.trim(),
+  );
+}
+
+async function pushEncryptedSyncObject(
+  settings: SyncSettings,
+  key: string,
+  value: unknown,
+): Promise<number> {
+  const envelope = await encryptSyncObject(value, settings.syncCode.trim());
+  const body = JSON.stringify(envelope);
+  const response = await fetch(syncV2ObjectUrl(settings.endpoint, key), {
+    method: "PUT",
+    headers: {
+      ...authHeaders(settings),
+      "Content-Type": "application/json",
+    },
+    body,
+  });
+  if (!response.ok) throw await responseError(response);
+  return new TextEncoder().encode(body).byteLength;
+}
+
+async function pushIncrementalManifest(
+  settings: SyncSettings,
+  manifest: CedarSyncV2Manifest,
+): Promise<number> {
+  const envelope = await encryptSyncObject(manifest, settings.syncCode.trim());
+  const body = JSON.stringify(envelope);
+  const response = await fetch(syncV2Url(settings.endpoint, "/manifest"), {
+    method: "PUT",
+    headers: {
+      ...authHeaders(settings),
+      "Content-Type": "application/json",
+    },
+    body,
+  });
+  if (!response.ok) throw await responseError(response);
+  return new TextEncoder().encode(body).byteLength;
+}
+
+function syncObject<T>(key: string, value: T): { key: string; value: T } {
+  return { key, value };
+}
+
+async function objectRef(
+  item: { key: string; value: unknown },
+): Promise<SyncObjectRef> {
+  return {
+    key: item.key,
+    hash: await sha256Hex(JSON.stringify(item.value)),
+  };
+}
+
+function sameRef(
+  a: SyncObjectRef | undefined,
+  b: SyncObjectRef | undefined,
+): boolean {
+  return Boolean(a && b && a.key === b.key && a.hash === b.hash);
+}
+
+async function buildIncrementalManifestAndObjects(
+  snapshot: CedarSyncSnapshot,
+): Promise<{
+  manifest: CedarSyncV2Manifest;
+  objects: Array<{ key: string; value: unknown; ref: SyncObjectRef }>;
+}> {
+  const baseObjects = [
+    syncObject("state/current.json", snapshot.current),
+    syncObject("state/preferences.json", snapshot.preferences),
+    syncObject("state/providers.json", snapshot.providers),
+    syncObject("state/mcpServers.json", snapshot.mcpServers),
+    syncObject("state/ttsSettings.json", snapshot.ttsSettings),
+  ];
+  const agentObjects = snapshot.agents.map((agent) =>
+    syncObject(`agents/${agent.id}.json`, agent),
+  );
+  const conversationMetaObjects = snapshot.conversations.map((conversation) =>
+    syncObject(`conversations/${conversation.id}/meta.json`, {
+      ...conversation,
+      messages: [],
+    }),
+  );
+  const messageObjects = snapshot.conversations.flatMap((conversation) =>
+    conversation.messages.map((message) =>
+      syncObject(
+        `conversations/${conversation.id}/messages/${message.id}.json`,
+        message,
+      ),
+    ),
+  );
+  const objectValues = [
+    ...baseObjects,
+    ...agentObjects,
+    ...conversationMetaObjects,
+    ...messageObjects,
+  ];
+  const refs = await Promise.all(objectValues.map(objectRef));
+  const objects = objectValues.map((object, index) => ({
+    ...object,
+    ref: refs[index],
+  }));
+  const refByKey = new Map(objects.map((object) => [object.key, object.ref]));
+  const requireRef = (key: string): SyncObjectRef => {
+    const ref = refByKey.get(key);
+    if (!ref) throw new Error(`Missing sync object ref for ${key}.`);
+    return ref;
+  };
+
+  return {
+    manifest: {
+      app: "cedar-chat-sync-v2",
+      version: 1,
+      updatedAt: snapshot.exportedAt,
+      ...(snapshot.deviceName ? { deviceName: snapshot.deviceName } : {}),
+      current: requireRef("state/current.json"),
+      preferences: requireRef("state/preferences.json"),
+      providers: requireRef("state/providers.json"),
+      mcpServers: requireRef("state/mcpServers.json"),
+      ttsSettings: requireRef("state/ttsSettings.json"),
+      agents: snapshot.agents.map((agent) => requireRef(`agents/${agent.id}.json`)),
+      activeAgentId: snapshot.activeAgentId,
+      conversations: snapshot.conversations.map((conversation) => ({
+        id: conversation.id,
+        updatedAt: conversation.updatedAt,
+        meta: requireRef(`conversations/${conversation.id}/meta.json`),
+        messages: conversation.messages.map((message) =>
+          requireRef(
+            `conversations/${conversation.id}/messages/${message.id}.json`,
+          ),
+        ),
+      })),
+      activeConversationId: snapshot.activeConversationId,
+    },
+    objects,
+  };
+}
+
+async function pushIncrementalSyncSnapshot(
+  settings: SyncSettings,
+  snapshot: CedarSyncSnapshot,
+): Promise<PushSyncResult> {
+  const previousManifest = await pullIncrementalManifest(settings);
+  const { manifest, objects } = await buildIncrementalManifestAndObjects(snapshot);
+  const previousRefs = new Map<string, SyncObjectRef>();
+  if (previousManifest) {
+    for (const ref of [
+      previousManifest.current,
+      previousManifest.preferences,
+      previousManifest.providers,
+      previousManifest.mcpServers,
+      previousManifest.ttsSettings,
+      ...previousManifest.agents,
+    ]) {
+      previousRefs.set(ref.key, ref);
+    }
+    for (const conversation of previousManifest.conversations) {
+      previousRefs.set(conversation.meta.key, conversation.meta);
+      for (const ref of conversation.messages) previousRefs.set(ref.key, ref);
+    }
+  }
+
+  let bytes = 0;
+  for (const object of objects) {
+    if (sameRef(previousRefs.get(object.key), object.ref)) continue;
+    bytes += await pushEncryptedSyncObject(settings, object.key, object.value);
+  }
+  bytes += await pushIncrementalManifest(settings, manifest);
+
+  return {
+    updatedAt: manifest.updatedAt,
+    bytes,
+  };
+}
+
+async function pullIncrementalSyncSnapshot(
+  settings: SyncSettings,
+): Promise<CedarSyncSnapshot | null> {
+  const manifest = await pullIncrementalManifest(settings);
+  if (!manifest) return null;
+
+  const [
+    current,
+    preferences,
+    providers,
+    mcpServers,
+    ttsSettings,
+    agents,
+    conversations,
+  ] = await Promise.all([
+    pullEncryptedSyncObject<CurrentSelection>(settings, manifest.current),
+    pullEncryptedSyncObject<Preferences>(settings, manifest.preferences),
+    pullEncryptedSyncObject<ProviderConfig[]>(settings, manifest.providers),
+    pullEncryptedSyncObject<McpServerConfig[]>(settings, manifest.mcpServers),
+    pullEncryptedSyncObject<TtsSettings>(settings, manifest.ttsSettings),
+    Promise.all(
+      manifest.agents.map((ref) => pullEncryptedSyncObject<Agent>(settings, ref)),
+    ),
+    Promise.all(
+      manifest.conversations.map(async (entry) => {
+        const meta = await pullEncryptedSyncObject<Conversation>(
+          settings,
+          entry.meta,
+        );
+        const messages = await Promise.all(
+          entry.messages.map((ref) =>
+            pullEncryptedSyncObject<Conversation["messages"][number]>(
+              settings,
+              ref,
+            ),
+          ),
+        );
+        return { ...meta, messages };
+      }),
+    ),
+  ]);
+
+  return {
+    app: "cedar-chat",
+    version: 1,
+    exportedAt: manifest.updatedAt,
+    ...(manifest.deviceName ? { deviceName: manifest.deviceName } : {}),
+    current,
+    preferences,
+    providers,
+    mcpServers,
+    ttsSettings,
+    agents,
+    activeAgentId: manifest.activeAgentId,
+    conversations,
+    activeConversationId: manifest.activeConversationId,
+  };
+}
+
 export async function pushSyncSnapshot(
   settings: SyncSettings,
   snapshot: CedarSyncSnapshot,
 ): Promise<PushSyncResult> {
+  if (await incrementalSyncAvailable(settings)) {
+    return pushIncrementalSyncSnapshot(settings, snapshot);
+  }
+
   const syncCode = settings.syncCode.trim();
   const envelope = await encryptSnapshot(snapshot, syncCode);
   const body = JSON.stringify(envelope);
@@ -355,6 +861,11 @@ export async function pushSyncSnapshot(
 export async function pullSyncSnapshot(
   settings: SyncSettings,
 ): Promise<CedarSyncSnapshot | null> {
+  if (await incrementalSyncAvailable(settings)) {
+    const incrementalSnapshot = await pullIncrementalSyncSnapshot(settings);
+    if (incrementalSnapshot) return incrementalSnapshot;
+  }
+
   let response: Response;
 
   try {

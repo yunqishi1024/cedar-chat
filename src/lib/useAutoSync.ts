@@ -1,141 +1,180 @@
 import { useCallback, useEffect, useRef } from "react";
 import type { SyncSettings } from "./storage";
 import type { CedarSyncSnapshot } from "./sync";
-import { pullSyncSnapshot, pushSyncSnapshot } from "./sync";
+import {
+  pullSyncSnapshot,
+  pushSyncSnapshot,
+  syncSnapshotDataSignature,
+} from "./sync";
 
 export interface AutoSyncCallbacks {
-  /** Build the current local snapshot */
   createSnapshot: () => CedarSyncSnapshot;
-  /** Merge remote into local and apply */
-  mergeAndApply: (local: CedarSyncSnapshot, cloud: CedarSyncSnapshot) => CedarSyncSnapshot;
-  /** Apply merged snapshot to app state */
+  mergeAndApply: (
+    local: CedarSyncSnapshot,
+    cloud: CedarSyncSnapshot,
+  ) => CedarSyncSnapshot;
   applySnapshot: (snapshot: CedarSyncSnapshot) => void;
-  /** Update sync timestamps */
   onSyncComplete: (pushed: boolean, pulled: boolean) => void;
-  /** Report errors (non-blocking) */
   onSyncError?: (error: Error) => void;
-  /** Report status messages */
-  onSyncStatus?: (message: string) => void;
-  /** Return true if AI is currently streaming — sync will be skipped */
+  onSyncStatus?: (message: string | null) => void;
   isStreaming?: () => boolean;
+  localVersion?: string;
 }
 
-/**
- * Auto-sync hook: periodically pulls from cloud, merges, and pushes back.
- * Sync only fires when:
- *  - autoSyncEnabled is true
- *  - endpoint and syncCode are valid (syncCode >= 8 chars)
- *  - the tab is visible (document.visibilityState === "visible")
- *
- * Also syncs on:
- *  - visibility change (tab becomes visible again)
- *  - online event (network reconnects)
- */
 export function useAutoSync(
   syncSettings: SyncSettings,
   callbacks: AutoSyncCallbacks,
 ): void {
   const busyRef = useRef(false);
+  const pendingSyncRef = useRef(false);
+  const retryTimerRef = useRef<number | null>(null);
+  const doSyncRef = useRef<(() => Promise<void>) | null>(null);
   const callbacksRef = useRef(callbacks);
-  callbacksRef.current = callbacks;
-
+  const localVersion = callbacks.localVersion;
   const settingsRef = useRef(syncSettings);
-  settingsRef.current = syncSettings;
+
+  useEffect(() => {
+    callbacksRef.current = callbacks;
+  }, [callbacks]);
+
+  useEffect(() => {
+    settingsRef.current = syncSettings;
+  }, [syncSettings]);
 
   const canSync = useCallback((): boolean => {
-    const s = settingsRef.current;
+    const settings = settingsRef.current;
     return (
-      s.autoSyncEnabled &&
-      Boolean(s.endpoint.trim()) &&
-      s.syncCode.trim().length >= 8
+      settings.autoSyncEnabled &&
+      Boolean(settings.endpoint.trim()) &&
+      settings.syncCode.trim().length >= 8
     );
   }, []);
 
   const doSync = useCallback(async () => {
-    if (busyRef.current) return;
+    if (busyRef.current) {
+      pendingSyncRef.current = true;
+      return;
+    }
     if (!canSync()) return;
-    // Skip sync while AI is streaming to avoid interruption
-    if (callbacksRef.current.isStreaming?.()) return;
+    if (document.visibilityState !== "visible") {
+      pendingSyncRef.current = true;
+      return;
+    }
+    if (callbacksRef.current.isStreaming?.()) {
+      pendingSyncRef.current = true;
+      if (retryTimerRef.current === null) {
+        retryTimerRef.current = window.setTimeout(() => {
+          retryTimerRef.current = null;
+          void doSyncRef.current?.();
+        }, 1_000);
+      }
+      return;
+    }
 
     busyRef.current = true;
-    const { createSnapshot, mergeAndApply, applySnapshot, onSyncComplete, onSyncError, onSyncStatus } =
-      callbacksRef.current;
+    const {
+      createSnapshot,
+      mergeAndApply,
+      applySnapshot,
+      onSyncComplete,
+      onSyncError,
+      onSyncStatus,
+    } = callbacksRef.current;
     const settings = settingsRef.current;
 
     try {
       onSyncStatus?.("Auto-syncing...");
       const localSnapshot = createSnapshot();
-
-      // Guard: if local is empty (no real conversations), only pull — never push empty data
-      const localIsEmpty =
-        localSnapshot.conversations.length === 0 ||
-        (localSnapshot.conversations.length === 1 &&
-          localSnapshot.conversations[0].messages.length === 0);
+      const localIsEmpty = !snapshotHasMessages(localSnapshot);
 
       if (localIsEmpty) {
         const cloudSnapshot = await pullSyncSnapshot(settings);
-        if (cloudSnapshot && cloudSnapshot.conversations.length > 0) {
+        if (cloudSnapshot && snapshotHasMessages(cloudSnapshot)) {
           applySnapshot(cloudSnapshot);
         }
         onSyncComplete(false, Boolean(cloudSnapshot));
-        onSyncStatus?.(null as unknown as string);
+        pendingSyncRef.current = false;
+        onSyncStatus?.(null);
         return;
       }
 
-      // Step 1: Pull from cloud first
       const cloudSnapshot = await pullSyncSnapshot(settings);
-
-      // Step 2: Merge local + cloud
       const mergedSnapshot = cloudSnapshot
         ? mergeAndApply(localSnapshot, cloudSnapshot)
         : localSnapshot;
+      const localSignature = syncSnapshotDataSignature(localSnapshot);
+      const cloudSignature = cloudSnapshot
+        ? syncSnapshotDataSignature(cloudSnapshot)
+        : null;
+      const mergedSignature = syncSnapshotDataSignature(mergedSnapshot);
 
-      // Step 3: Apply merged result if cloud contributed new content
-      if (cloudSnapshot) {
-        const localIds = localSnapshot.conversations.map(c => c.id).sort().join(",");
-        const mergedIds = mergedSnapshot.conversations.map(c => c.id).sort().join(",");
-        const localMsgCount = localSnapshot.conversations.reduce((n, c) => n + c.messages.length, 0);
-        const mergedMsgCount = mergedSnapshot.conversations.reduce((n, c) => n + c.messages.length, 0);
-        if (localIds !== mergedIds || localMsgCount !== mergedMsgCount) {
-          applySnapshot(mergedSnapshot);
-        }
+      if (cloudSnapshot && mergedSignature !== localSignature) {
+        applySnapshot(mergedSnapshot);
       }
 
-      // Step 4: Push merged result to cloud
-      await pushSyncSnapshot(settings, mergedSnapshot);
-      onSyncComplete(true, Boolean(cloudSnapshot));
-      onSyncStatus?.(null as unknown as string);
+      const shouldPush = !cloudSnapshot || mergedSignature !== cloudSignature;
+      if (shouldPush) {
+        await pushSyncSnapshot(settings, mergedSnapshot);
+      }
+      onSyncComplete(shouldPush, Boolean(cloudSnapshot));
+      pendingSyncRef.current = false;
+      onSyncStatus?.(null);
     } catch (error: unknown) {
       const err = error instanceof Error ? error : new Error(String(error));
+      pendingSyncRef.current = false;
       onSyncError?.(err);
       onSyncStatus?.(`Auto-sync failed: ${err.message}`);
     } finally {
       busyRef.current = false;
+      if (pendingSyncRef.current && retryTimerRef.current === null) {
+        retryTimerRef.current = window.setTimeout(() => {
+          retryTimerRef.current = null;
+          void doSyncRef.current?.();
+        }, 500);
+      }
     }
   }, [canSync]);
 
-  // Periodic interval
+  useEffect(() => {
+    doSyncRef.current = doSync;
+  }, [doSync]);
+
+  useEffect(() => {
+    if (!syncSettings.autoSyncEnabled) return;
+    if (!syncSettings.endpoint.trim() || syncSettings.syncCode.trim().length < 8) return;
+    if (!localVersion) return;
+
+    const delayMs = Math.min(
+      2_000,
+      Math.max(800, Math.round(syncSettings.autoSyncIntervalMs / 5)),
+    );
+    const timer = window.setTimeout(() => {
+      void doSync();
+    }, delayMs);
+    return () => window.clearTimeout(timer);
+  }, [
+    syncSettings.autoSyncEnabled,
+    syncSettings.autoSyncIntervalMs,
+    syncSettings.endpoint,
+    syncSettings.syncCode,
+    localVersion,
+    doSync,
+  ]);
+
   useEffect(() => {
     if (!syncSettings.autoSyncEnabled) return;
     if (!syncSettings.endpoint.trim() || syncSettings.syncCode.trim().length < 8) return;
 
-    const intervalMs = syncSettings.autoSyncIntervalMs;
-
-    // Run once immediately on enable
-    const initialTimeout = setTimeout(() => {
-      doSync();
+    const initialTimeout = window.setTimeout(() => {
+      void doSync();
     }, 500);
-
-    const intervalId = setInterval(() => {
-      // Only sync when tab is visible to avoid unnecessary network requests
-      if (document.visibilityState === "visible") {
-        doSync();
-      }
-    }, intervalMs);
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === "visible") void doSync();
+    }, syncSettings.autoSyncIntervalMs);
 
     return () => {
-      clearTimeout(initialTimeout);
-      clearInterval(intervalId);
+      window.clearTimeout(initialTimeout);
+      window.clearInterval(intervalId);
     };
   }, [
     syncSettings.autoSyncEnabled,
@@ -145,12 +184,11 @@ export function useAutoSync(
     doSync,
   ]);
 
-  // Sync when tab becomes visible again (user switches back)
   useEffect(() => {
     if (!syncSettings.autoSyncEnabled) return;
 
     function handleVisibilityChange() {
-      doSync();
+      if (document.visibilityState === "visible") void doSync();
     }
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -159,12 +197,11 @@ export function useAutoSync(
     };
   }, [syncSettings.autoSyncEnabled, doSync]);
 
-  // Sync when network comes back online
   useEffect(() => {
     if (!syncSettings.autoSyncEnabled) return;
 
     function handleOnline() {
-      doSync();
+      void doSync();
     }
 
     window.addEventListener("online", handleOnline);
@@ -172,4 +209,19 @@ export function useAutoSync(
       window.removeEventListener("online", handleOnline);
     };
   }, [syncSettings.autoSyncEnabled, doSync]);
+
+  useEffect(
+    () => () => {
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+      }
+    },
+    [],
+  );
+}
+
+function snapshotHasMessages(snapshot: CedarSyncSnapshot): boolean {
+  return snapshot.conversations.some(
+    (conversation) => conversation.messages.length > 0,
+  );
 }
