@@ -86,10 +86,21 @@ import {
   type McpToolSummary,
 } from "./lib/mcp";
 import {
+  searchConversationTitles,
+  searchConversations,
+  type SearchResult,
+} from "./lib/search";
+import {
+  loadLocalBackup,
+  saveLocalBackupSoon,
+  type CedarLocalBackup,
+} from "./lib/localBackup";
+import {
   pullSyncBlob,
   pullSyncSnapshot,
   pushSyncBlob,
   pushSyncSnapshot,
+  syncSnapshotDataSignature,
   type CedarSyncBlobRef,
   type CedarSyncSnapshot,
 } from "./lib/sync";
@@ -128,6 +139,9 @@ interface ActiveMcpTool {
   chatTool: ChatTool;
 }
 
+type ChatHistorySearchScope = "current" | "all";
+type SidebarSearchScope = "agent" | "all";
+
 const DEFAULT_TEMPERATURE = 0.7;
 const DEFAULT_REASONING_ENABLED = true;
 const DEFAULT_THINKING_MODE: ThinkingMode = "effort";
@@ -142,6 +156,9 @@ const DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS = 160;
 const MAX_MCP_TOOL_ROUNDS = 6;
 const MAX_MCP_RESULT_CHARS = 120_000;
 const MAX_TOOL_BLOCK_CHARS = 4_000;
+const CHAT_HISTORY_SEARCH_TOOL_NAME = "search_chat_history";
+const DEFAULT_CHAT_HISTORY_SEARCH_LIMIT = 10;
+const MAX_CHAT_HISTORY_SEARCH_LIMIT = 30;
 const WEATHER_LOCATION = "Beijing";
 const WEATHER_FALLBACK_LABEL = "多云";
 const TOKENS_PER_MILLION = 1_000_000;
@@ -165,6 +182,8 @@ type WindowSettingsPatch = Partial<
     | "thinkingBudgetTokens"
     | "agentPromptCache"
     | "contextPromptCache"
+    | "summaryProviderId"
+    | "summaryModel"
     | "showMessageTimestamps"
     | "injectCurrentTime"
     | "multiMessageEnabled"
@@ -212,6 +231,8 @@ function createEmptyConversation(agentId: string | null): Conversation {
     thinkingBudgetTokens: DEFAULT_THINKING_BUDGET_TOKENS,
     agentPromptCache: DEFAULT_AGENT_PROMPT_CACHE,
     contextPromptCache: DEFAULT_CONTEXT_PROMPT_CACHE,
+    summaryProviderId: null,
+    summaryModel: null,
     showMessageTimestamps: false,
     injectCurrentTime: false,
     multiMessageEnabled: DEFAULT_MULTI_MESSAGE_ENABLED,
@@ -459,6 +480,135 @@ async function prepareMcpTools(
   );
 }
 
+const CHAT_HISTORY_SEARCH_TOOL: ChatTool = {
+  type: "function",
+  function: {
+    name: CHAT_HISTORY_SEARCH_TOOL_NAME,
+    description:
+      "Search saved Cedar Chat conversation history. Use scope='current' to search this chat window, or scope='all' to search across all chat windows.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Text to find in conversation titles, messages, attachments, or tool output.",
+        },
+        scope: {
+          type: "string",
+          enum: ["current", "all"],
+          description: "Search only the current chat window or all saved chat windows.",
+        },
+        maxResults: {
+          type: "number",
+          description: `Maximum results to return, up to ${MAX_CHAT_HISTORY_SEARCH_LIMIT}.`,
+        },
+      },
+      required: ["query"],
+    },
+  },
+};
+
+function normalizeChatHistorySearchScope(value: unknown): ChatHistorySearchScope {
+  return value === "current" ? "current" : "all";
+}
+
+function normalizeChatHistorySearchLimit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_CHAT_HISTORY_SEARCH_LIMIT;
+  }
+  return Math.max(
+    1,
+    Math.min(MAX_CHAT_HISTORY_SEARCH_LIMIT, Math.round(value)),
+  );
+}
+
+function chatHistorySearchCorpus(
+  conversations: Conversation[],
+  currentConversationId: string,
+  currentPromptMessages: StoredMessage[],
+): Conversation[] {
+  let replacedCurrent = false;
+  const next = conversations.map((conversation) => {
+    if (conversation.id !== currentConversationId) return conversation;
+    replacedCurrent = true;
+    return {
+      ...conversation,
+      messages: currentPromptMessages,
+    };
+  });
+  return replacedCurrent ? next : conversations;
+}
+
+function formatSearchResultTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+function formatChatHistorySearchToolResult(
+  query: string,
+  scope: ChatHistorySearchScope,
+  results: SearchResult[],
+  titleMatches: Conversation[],
+): string {
+  return JSON.stringify(
+    {
+      query,
+      scope,
+      count: results.length + titleMatches.length,
+      messageResultCount: results.length,
+      titleMatchCount: titleMatches.length,
+      titleMatches: titleMatches.map((conversation) => ({
+        conversationId: conversation.id,
+        conversationTitle: conversation.title,
+        messageCount: conversation.messages.length,
+        updatedAt: formatSearchResultTime(conversation.updatedAt),
+      })),
+      results: results.map((result) => ({
+        conversationId: result.conversationId,
+        conversationTitle: result.conversationTitle,
+        messageId: result.messageId,
+        messageNumber: result.messageIndex + 1,
+        role: result.messageRole,
+        createdAt: formatSearchResultTime(result.createdAt),
+        snippet: result.matchText,
+      })),
+    },
+    null,
+    2,
+  );
+}
+
+function runChatHistorySearchTool(
+  args: Record<string, unknown>,
+  conversations: Conversation[],
+  currentConversationId: string,
+): string {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  if (!query) {
+    return JSON.stringify(
+      {
+        error: "query is required",
+        results: [],
+      },
+      null,
+      2,
+    );
+  }
+
+  const scope = normalizeChatHistorySearchScope(args.scope);
+  const maxResults = normalizeChatHistorySearchLimit(args.maxResults);
+  const corpus =
+    scope === "current"
+      ? conversations.filter((conversation) => conversation.id === currentConversationId)
+      : conversations;
+  const results = searchConversations(corpus, query, maxResults);
+  const messageMatchIds = new Set(results.map((result) => result.conversationId));
+  const titleMatches = searchConversationTitles(corpus, query)
+    .filter((conversation) => !messageMatchIds.has(conversation.id))
+    .slice(0, maxResults);
+  return formatChatHistorySearchToolResult(query, scope, results, titleMatches);
+}
+
 function parseToolArguments(raw: string): Record<string, unknown> {
   if (!raw.trim()) return {};
   const parsed = JSON.parse(raw) as unknown;
@@ -548,10 +698,16 @@ function formatUsd(amount: number): string {
   return `$${amount.toFixed(2)}`;
 }
 
+function formatCostRangeLabel(minCost: number, maxCost: number): string {
+  return Math.abs(maxCost - minCost) < 0.000001
+    ? `≈ ${formatUsd(maxCost)}`
+    : `≈ ${formatUsd(minCost)}-${formatUsd(maxCost)}`;
+}
+
 function estimateMessageCost(
   modelName: string | null,
   usage: NonNullable<UIMessage["usage"]>,
-): { label: string; title: string } | null {
+): { label: string; title: string; minCost: number; maxCost: number } | null {
   const modelMatched = isOpus46Or47Model(modelName);
   const cachedInputTokens = Math.max(0, usage.cachedInputTokens ?? 0);
   const cacheWriteInputTokens = Math.max(0, usage.cacheWriteInputTokens ?? 0);
@@ -585,13 +741,12 @@ function estimateMessageCost(
     standardInputCost + cacheReadCost + cacheWriteCost5m + outputCost;
   const maxCost =
     standardInputCost + cacheReadCost + cacheWriteCost1h + outputCost;
-  const label =
-    Math.abs(maxCost - minCost) < 0.000001
-      ? `≈ ${formatUsd(maxCost)}`
-      : `≈ ${formatUsd(minCost)}-${formatUsd(maxCost)}`;
+  const label = formatCostRangeLabel(minCost, maxCost);
 
   return {
     label,
+    minCost,
+    maxCost,
     title:
       "Claude Opus 4.6/4.7 standard API estimate" +
       (modelMatched ? "" : " (model name was not recognized, using Opus pricing)") +
@@ -600,6 +755,37 @@ function estimateMessageCost(
       `cache hit ${cachedInputTokens} @ $0.50/M, ` +
       `cache write ${cacheWriteInputTokens} @ $6.25-$10/M, ` +
       `output ${outputTokens} @ $25/M.`,
+  };
+}
+
+function estimateConversationCost(
+  messages: UIMessage[],
+  fallbackModelName: string | null,
+): { label: string; title: string; count: number } | null {
+  let minCost = 0;
+  let maxCost = 0;
+  let count = 0;
+
+  for (const message of messages) {
+    if (!message.usage || message.streaming) continue;
+    const estimate = estimateMessageCost(
+      message.model ?? fallbackModelName,
+      message.usage,
+    );
+    if (!estimate) continue;
+    minCost += estimate.minCost;
+    maxCost += estimate.maxCost;
+    count += 1;
+  }
+
+  if (count === 0) return null;
+
+  return {
+    label: formatCostRangeLabel(minCost, maxCost),
+    title:
+      `Total estimate for ${count} completed response${count === 1 ? "" : "s"}. ` +
+      "Uses the same Claude Opus 4.6/4.7 pricing estimate shown below each message.",
+    count,
   };
 }
 
@@ -1525,6 +1711,12 @@ function isConversation(value: unknown): value is Conversation {
       typeof value.contextPromptCache === "string") &&
     (value.claudePromptCache === undefined ||
       typeof value.claudePromptCache === "string") &&
+    (value.summaryProviderId === undefined ||
+      value.summaryProviderId === null ||
+      typeof value.summaryProviderId === "string") &&
+    (value.summaryModel === undefined ||
+      value.summaryModel === null ||
+      typeof value.summaryModel === "string") &&
     (value.showMessageTimestamps === undefined ||
       typeof value.showMessageTimestamps === "boolean") &&
     (value.injectCurrentTime === undefined ||
@@ -1682,14 +1874,43 @@ function mergeMessages(
   preferLocal: boolean,
 ): StoredMessage[] {
   const merged = new Map<string, StoredMessage>();
-  for (const message of preferLocal ? cloudMessages : localMessages) {
+  const lowerPriority = preferLocal ? cloudMessages : localMessages;
+  const higherPriority = preferLocal ? localMessages : cloudMessages;
+  for (const message of lowerPriority) {
     merged.set(message.id, message);
   }
-  for (const message of preferLocal ? localMessages : cloudMessages) {
-    merged.set(message.id, message);
+  for (const message of higherPriority) {
+    const existing = merged.get(message.id);
+    merged.set(
+      message.id,
+      existing ? pickMergedMessage(message, existing) : message,
+    );
   }
   return [...merged.values()].sort(
     (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0),
+  );
+}
+
+function pickMergedMessage(
+  preferred: StoredMessage,
+  fallback: StoredMessage,
+): StoredMessage {
+  if (preferred.role !== "assistant" || fallback.role !== "assistant") {
+    return preferred;
+  }
+  if (preferred.usage && !fallback.usage) return preferred;
+  if (!preferred.usage && fallback.usage) return fallback;
+
+  const preferredWeight = messageContentWeight(preferred);
+  const fallbackWeight = messageContentWeight(fallback);
+  return fallbackWeight > preferredWeight ? fallback : preferred;
+}
+
+function messageContentWeight(message: StoredMessage): number {
+  return (
+    contentBlocksToPlainText(message.content, true).length +
+    message.content.length * 100 +
+    (message.usage ? 10_000 : 0)
   );
 }
 
@@ -1860,6 +2081,14 @@ function normalizeConversationsForAgents(
         conversation.claudePromptCache ?? fallbackCacheMode,
       ).contextPromptCache,
     ),
+    summaryProviderId:
+      typeof conversation.summaryProviderId === "string"
+        ? conversation.summaryProviderId
+        : null,
+    summaryModel:
+      typeof conversation.summaryModel === "string"
+        ? conversation.summaryModel
+        : null,
     showMessageTimestamps: conversation.showMessageTimestamps ?? false,
     injectCurrentTime: conversation.injectCurrentTime ?? false,
     multiMessageEnabled:
@@ -1912,6 +2141,79 @@ function loadInitialChatState(): {
   };
 }
 
+function hasPersistedMessages(conversations: Conversation[]): boolean {
+  return conversations.some((conversation) => conversation.messages.length > 0);
+}
+
+function chatStateFromLocalBackup(backup: CedarLocalBackup): {
+  agents: Agent[];
+  activeAgentId: string | null;
+  conversations: Conversation[];
+  activeConversationId: string | null;
+} {
+  const agents = backup.agents.length > 0 ? backup.agents : [createDefaultAgent()];
+  const activeAgentId =
+    backup.activeAgentId && agents.some((agent) => agent.id === backup.activeAgentId)
+      ? backup.activeAgentId
+      : (agents[0]?.id ?? null);
+  const conversations =
+    backup.conversations.length > 0
+      ? backup.conversations
+      : [createEmptyConversation(activeAgentId)];
+  const activeConversationId =
+    backup.activeConversationId &&
+    conversations.some(
+      (conversation) => conversation.id === backup.activeConversationId,
+    )
+      ? backup.activeConversationId
+      : (conversations[0]?.id ?? null);
+
+  return {
+    agents,
+    activeAgentId,
+    conversations,
+    activeConversationId,
+  };
+}
+
+function localSyncVersion(
+  providers: ProviderConfig[],
+  current: CurrentSelection,
+  preferences: Preferences,
+  mcpServers: McpServerConfig[],
+  ttsSettings: TtsSettings,
+  agents: Agent[],
+  activeAgentId: string | null,
+  conversations: Conversation[],
+  activeConversationId: string | null,
+  userStyle: string,
+): string {
+  return JSON.stringify({
+    providers,
+    current,
+    preferences,
+    mcpServers,
+    ttsSettings,
+    agents: agents.map((agent) => ({
+      id: agent.id,
+      updatedAt: agent.updatedAt,
+    })),
+    activeAgentId,
+    conversations: conversations.map((conversation) => {
+      const lastMessage = conversation.messages.at(-1);
+      return {
+        id: conversation.id,
+        updatedAt: conversation.updatedAt,
+        messageCount: conversation.messages.length,
+        lastMessageId: lastMessage?.id ?? null,
+        lastMessageWeight: lastMessage ? messageContentWeight(lastMessage) : 0,
+      };
+    }),
+    activeConversationId,
+    userStyle,
+  });
+}
+
 // ------------------------- App -------------------------
 
 export default function App() {
@@ -1957,11 +2259,15 @@ export default function App() {
       | Conversation[]
       | ((previousConversations: Conversation[]) => Conversation[]),
   ) {
-    setChatState((previous) => ({
-      ...previous,
-      conversations:
-        typeof next === "function" ? next(previous.conversations) : next,
-    }));
+    setChatState((previous) => {
+      const nextConversations =
+        typeof next === "function" ? next(previous.conversations) : next;
+      saveConversations(nextConversations);
+      return {
+        ...previous,
+        conversations: nextConversations,
+      };
+    });
   }
 
   function setActiveConversationId(id: string | null) {
@@ -1989,6 +2295,20 @@ export default function App() {
         activeConversationId: conversation.id,
       };
     });
+    setSidebarOpen(false);
+    cancelEditing();
+  }
+
+  function selectConversation(conversationId: string, messageId?: string) {
+    const target = conversations.find(
+      (conversation) => conversation.id === conversationId,
+    );
+    setChatState((previous) => ({
+      ...previous,
+      activeAgentId: target?.agentId ?? previous.activeAgentId,
+      activeConversationId: conversationId,
+    }));
+    if (messageId) setPendingSearchMessageId(messageId);
     setSidebarOpen(false);
     cancelEditing();
   }
@@ -2050,7 +2370,18 @@ export default function App() {
   const [exportSelectedIds, setExportSelectedIds] = useState<string[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [conversationSearchQuery, setConversationSearchQuery] = useState("");
+  const [conversationSearchScope, setConversationSearchScope] =
+    useState<SidebarSearchScope>("agent");
+  const [pendingSearchMessageId, setPendingSearchMessageId] = useState<
+    string | null
+  >(null);
   const [contextOpen, setContextOpen] = useState(false);
+  const [pinSummaryError, setPinSummaryError] = useState<{
+    conversationId: string;
+    messageId: string;
+    message: string;
+  } | null>(null);
   const [beijingTime, setBeijingTime] = useState(() => formatBeijingClock());
   const [weatherLabel, setWeatherLabel] = useState(WEATHER_FALLBACK_LABEL);
   const [agentsOpen, setAgentsOpen] = useState(false);
@@ -2058,6 +2389,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncStatus, setSyncStatus] = useState<string | null>(null);
+  const [localBackupReady, setLocalBackupReady] = useState(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [autoPlayVoiceBlockIds, setAutoPlayVoiceBlockIds] = useState<
     ReadonlySet<string>
@@ -2069,6 +2401,9 @@ export default function App() {
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const initialHasPersistedMessagesRef = useRef(
+    hasPersistedMessages(conversations),
+  );
 
   // --- 派生值 ---
   const activeProviderId = activeConversation?.providerId ?? currentProviderId;
@@ -2087,6 +2422,36 @@ export default function App() {
   const voiceMessageBudgetTokens =
     activeConversation?.voiceMessageBudgetTokens ??
     DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS;
+  const trimmedConversationSearchQuery = conversationSearchQuery.trim();
+  const sidebarSearchConversations =
+    conversationSearchScope === "all" ? conversations : agentConversations;
+  const conversationSearchResults = useMemo(
+    () =>
+      trimmedConversationSearchQuery
+        ? searchConversations(
+            sidebarSearchConversations,
+            trimmedConversationSearchQuery,
+            80,
+          )
+        : [],
+    [sidebarSearchConversations, trimmedConversationSearchQuery],
+  );
+  const titleOnlySearchConversations = useMemo(() => {
+    if (!trimmedConversationSearchQuery) return [];
+    const messageMatchIds = new Set(
+      conversationSearchResults.map((result) => result.conversationId),
+    );
+    return searchConversationTitles(
+      sidebarSearchConversations,
+      trimmedConversationSearchQuery,
+    ).filter((conversation) => !messageMatchIds.has(conversation.id));
+  }, [
+    conversationSearchResults,
+    sidebarSearchConversations,
+    trimmedConversationSearchQuery,
+  ]);
+  const hasConversationSearchResults =
+    conversationSearchResults.length > 0 || titleOnlySearchConversations.length > 0;
 
   const currentProvider = useMemo(
     () => providers.find((p) => p.id === activeProviderId) ?? null,
@@ -2100,6 +2465,24 @@ export default function App() {
         : (currentProvider?.models[0] ?? null),
     [activeModel, currentProvider],
   );
+
+  const summaryProviderId =
+    activeConversation?.summaryProviderId ?? activeProviderId;
+  const summaryProvider = useMemo(
+    () => providers.find((p) => p.id === summaryProviderId) ?? null,
+    [providers, summaryProviderId],
+  );
+  const activeSummaryModel = activeConversation?.summaryModel ?? null;
+  const selectedSummaryModel =
+    summaryProvider &&
+    activeSummaryModel &&
+    summaryProvider.models.includes(activeSummaryModel)
+      ? activeSummaryModel
+      : (summaryProvider?.models[0] ?? null);
+  const activePinSummaryError =
+    pinSummaryError?.conversationId === activeConversation?.id
+      ? pinSummaryError
+      : null;
 
   const capability = useMemo(
     () => (selectedModel ? getCapability(selectedModel) : null),
@@ -2126,6 +2509,10 @@ export default function App() {
     () => messages.findLast((message) => message.usage)?.usage,
     [messages],
   );
+  const conversationCostEstimate = useMemo(
+    () => estimateConversationCost(messages, selectedModel),
+    [messages, selectedModel],
+  );
   const enabledMcpServers = useMemo(
     () => mcpServers.filter((server) => server.enabled),
     [mcpServers],
@@ -2143,8 +2530,117 @@ export default function App() {
       }) as CSSProperties,
     [preferences.chatFontSize],
   );
+  const syncLocalVersion = useMemo(
+    () =>
+      localSyncVersion(
+        providers,
+        {
+          providerId: activeProviderId ?? currentProviderId,
+          model: selectedModel ?? currentModel,
+        },
+        preferences,
+        mcpServers,
+        ttsSettings,
+        agents,
+        activeAgent?.id ?? activeAgentId,
+        conversations,
+        activeConversation?.id ?? activeConversationId,
+        userStyle,
+      ),
+    [
+      providers,
+      activeProviderId,
+      currentProviderId,
+      selectedModel,
+      currentModel,
+      preferences,
+      mcpServers,
+      ttsSettings,
+      agents,
+      activeAgent,
+      activeAgentId,
+      conversations,
+      activeConversation,
+      activeConversationId,
+      userStyle,
+    ],
+  );
 
   // --- 持久化副作用 ---
+  useEffect(() => {
+    let cancelled = false;
+
+    async function restoreLocalBackup() {
+      const backup = await loadLocalBackup();
+      if (cancelled) return;
+
+      if (
+        backup &&
+        !initialHasPersistedMessagesRef.current &&
+        hasPersistedMessages(backup.conversations)
+      ) {
+        setProviders(backup.providers);
+        setCurrentProviderId(backup.current.providerId);
+        setCurrentModel(backup.current.model);
+        setPreferences(backup.preferences);
+        setMcpServers(backup.mcpServers);
+        setTtsSettings(backup.ttsSettings);
+        setSyncSettings(backup.syncSettings);
+        setUserStyle(backup.userStyle);
+        setChatState(chatStateFromLocalBackup(backup));
+        setSyncStatus("Restored local history from this browser.");
+      }
+
+      setLocalBackupReady(true);
+    }
+
+    void restoreLocalBackup();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!localBackupReady) return;
+    saveLocalBackupSoon({
+      app: "cedar-chat-local-backup",
+      version: 1,
+      savedAt: Date.now(),
+      current: {
+        providerId: activeProviderId ?? currentProviderId,
+        model: selectedModel ?? currentModel,
+      },
+      preferences,
+      providers,
+      mcpServers,
+      ttsSettings,
+      syncSettings,
+      userStyle,
+      agents,
+      activeAgentId: activeAgent?.id ?? activeAgentId,
+      conversations: conversations.map(stripTransientConversation),
+      activeConversationId: activeConversation?.id ?? activeConversationId,
+    });
+  }, [
+    localBackupReady,
+    activeProviderId,
+    currentProviderId,
+    selectedModel,
+    currentModel,
+    preferences,
+    providers,
+    mcpServers,
+    ttsSettings,
+    syncSettings,
+    userStyle,
+    agents,
+    activeAgent,
+    activeAgentId,
+    conversations,
+    activeConversation,
+    activeConversationId,
+  ]);
+
   useEffect(() => {
     saveProviders(providers);
   }, [providers]);
@@ -2224,6 +2720,17 @@ export default function App() {
   useEffect(() => {
     saveActiveConversationId(activeConversation?.id ?? null);
   }, [activeConversation?.id]);
+
+  useEffect(() => {
+    if (!pendingSearchMessageId) return;
+    const timer = window.setTimeout(() => {
+      const element = document.getElementById(`msg-${pendingSearchMessageId}`);
+      if (!element) return;
+      element.scrollIntoView({ behavior: "smooth", block: "center" });
+      setPendingSearchMessageId(null);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [activeConversation?.id, messages.length, pendingSearchMessageId]);
 
   async function persistVoiceAudio(
     blob: Blob,
@@ -2360,10 +2867,18 @@ export default function App() {
       const provider = createProvider(currentProvider);
       const cap = getCapability(selectedModel);
       const activeMcpTools = await prepareMcpTools(mcpServers);
+      const toolSearchCorpus = chatHistorySearchCorpus(
+        conversations,
+        conversationId,
+        promptMessages,
+      );
       const mcpToolByName = new Map(
         activeMcpTools.map((tool) => [tool.functionName, tool]),
       );
-      const chatTools = activeMcpTools.map((tool) => tool.chatTool);
+      const chatTools = [
+        CHAT_HISTORY_SEARCH_TOOL,
+        ...activeMcpTools.map((tool) => tool.chatTool),
+      ];
 
       // 构造请求 - 只传当前模型实际支持的字段，剩下的 provider 内部会再过一遍
       // historyDepth: 取最后 N 条上下文；普通发送时 promptMessages 已经包含新用户消息
@@ -2375,33 +2890,38 @@ export default function App() {
         claudeCacheAvailable && contextPromptCache !== "off";
       const currentTimeAfterCache =
         contextCacheEnabled && injectCurrentTime;
-      
-      // Pin/Summary: 如果有 pinnedSummary，发 [summary pair (cached)] + [post-pin messages]
-      const pinnedSummary = activeConversation?.pinnedSummary;
+
+      // Pin/Summary: 如果有 pinnedSummary，发 [summary pair] + [post-pin messages].
+      // Context cache 只决定是否加 cache_control；pin 截断本身不依赖缓存开关。
+      const pinnedSummary =
+        activeConversation?.id === conversationId
+          ? activeConversation.pinnedSummary
+          : null;
       let requestMessages: ChatMessage[];
 
-      if (pinnedSummary && contextCacheEnabled) {
-        const pinIdx = trimmed.findIndex(
+      if (pinnedSummary) {
+        const pinIdx = promptMessages.findIndex(
           (m) => m.id === pinnedSummary.pinnedAtMessageId,
         );
+        const postPinSource = pinIdx >= 0 ? promptMessages.slice(pinIdx) : trimmed;
         const postPinMessages: ChatMessage[] =
-          pinIdx >= 0
-            ? trimmed.slice(pinIdx).map((m) => ({
-                role: m.role,
-                content: requestContentFromBlocks(m.content),
-              }))
-            : trimmed.map((m) => ({
-                role: m.role,
-                content: requestContentFromBlocks(m.content),
-              }));
+          postPinSource.map((m) => ({
+            role: m.role,
+            content: requestContentFromBlocks(m.content),
+          }));
 
-        const cacheCtrl = cacheControlForTTL(contextPromptCache);
+        const summaryText =
+          pinnedSummary.text.trim() ||
+          "There were no earlier messages before the pinned point.";
+        const cacheCtrl = contextCacheEnabled
+          ? cacheControlForTTL(contextPromptCache)
+          : undefined;
         const summaryUserMessage: ChatMessage = {
           role: "user",
           content: [
             {
               type: "text",
-              text: `<conversation-summary>\n${pinnedSummary.text}\n</conversation-summary>\n\nThe above is a summary of our earlier conversation. Continue from here.`,
+              text: `<conversation-summary>\n${summaryText}\n</conversation-summary>\n\nThe above is a summary of our earlier conversation. Continue from here.`,
               ...(cacheCtrl ? { cache_control: cacheCtrl } : {}),
             },
           ],
@@ -2577,7 +3097,11 @@ export default function App() {
 
         for (const toolCall of toolCalls) {
           const activeTool = mcpToolByName.get(toolCall.function.name);
-          const toolBlockName = activeTool?.displayName ?? toolCall.function.name;
+          const isHistorySearchTool =
+            toolCall.function.name === CHAT_HISTORY_SEARCH_TOOL_NAME;
+          const toolBlockName = isHistorySearchTool
+            ? "Chat history search"
+            : (activeTool?.displayName ?? toolCall.function.name);
           const toolBlockInput = formatToolInput(toolCall.function.arguments);
           toolBlocks = [
             ...toolBlocks,
@@ -2600,7 +3124,38 @@ export default function App() {
           );
           let toolResultText: string;
 
-          if (!activeTool) {
+          if (isHistorySearchTool) {
+            try {
+              const args = parseToolArguments(toolCall.function.arguments);
+              toolResultText = runChatHistorySearchTool(
+                args,
+                toolSearchCorpus,
+                conversationId,
+              );
+              toolBlocks = toolBlocks.map((block) =>
+                block.id === toolCall.id
+                  ? {
+                      ...block,
+                      status: "success",
+                      output: limitToolBlockText(toolResultText),
+                    }
+                  : block,
+              );
+            } catch (error: unknown) {
+              const detail =
+                error instanceof Error ? error.message : String(error);
+              toolResultText = `Chat history search failed: ${detail}`;
+              toolBlocks = toolBlocks.map((block) =>
+                block.id === toolCall.id
+                  ? {
+                      ...block,
+                      status: "error",
+                      error: detail,
+                    }
+                  : block,
+              );
+            }
+          } else if (!activeTool) {
             toolResultText = `MCP tool ${toolCall.function.name} is not available.`;
             toolBlocks = toolBlocks.map((block) =>
               block.id === toolCall.id
@@ -2758,7 +3313,24 @@ export default function App() {
         }
       }
     } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === assistantMessageId
+                      ? { ...m, streaming: false }
+                      : m,
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : c,
+          ),
+        );
+        return;
+      }
       const errText = err instanceof Error ? err.message : String(err);
       setConversations((prev) =>
         prev.map((c) =>
@@ -2770,6 +3342,7 @@ export default function App() {
                     ? {
                         ...m,
                         content: [{ type: "text", text: `Error: ${errText}` }],
+                        streaming: false,
                       }
                     : m,
                 ),
@@ -2938,11 +3511,11 @@ export default function App() {
           assistantMsg.id,
           `翻译完成！已自动下载 **${filename}**\n\n共翻译 ${parseResult.paragraphs.length} 个段落。`,
         );
-      } catch (err: any) {
+      } catch (err: unknown) {
         updateAssistantContent(
           conversationId,
           assistantMsg.id,
-          `翻译失败：${err.message}`,
+          `翻译失败：${err instanceof Error ? err.message : String(err)}`,
         );
       }
       return;
@@ -2978,7 +3551,7 @@ export default function App() {
     };
 
     const promptMessages = [...messages, userMessage].map(stripTransient);
-    const nextMessages = [...promptMessages, stripTransient(assistantMessage)];
+    const nextMessages = [...promptMessages, assistantMessage];
     const conversationId = activeConversation.id;
     setConversations((prev) =>
       prev.map((c) =>
@@ -3031,25 +3604,63 @@ export default function App() {
 
   
   async function handlePinMessage(messageId: string) {
-    if (!currentProvider || !selectedModel || busy || !activeConversation) return;
+    if (busy || !activeConversation) return;
+
+    if (activeConversation.pinnedSummary?.pinnedAtMessageId === messageId) {
+      setPinSummaryError(null);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === activeConversation.id
+            ? { ...c, pinnedSummary: null, updatedAt: Date.now() }
+            : c,
+        ),
+      );
+      return;
+    }
+
+    if (!summaryProvider || !selectedSummaryModel) {
+      setPinSummaryError({
+        conversationId: activeConversation.id,
+        messageId,
+        message: "Choose a summary model before pinning.",
+      });
+      return;
+    }
 
     const msgIndex = activeConversation.messages.findIndex(
       (m) => m.id === messageId,
     );
-    if (msgIndex <= 0) return;
+    if (msgIndex < 0) return;
 
     setBusy(true);
+    setPinSummaryError(null);
     try {
-      const provider = createProvider(currentProvider);
-      const messagesToSummarize = activeConversation.messages.slice(0, msgIndex);
-      const existingSummary = activeConversation.pinnedSummary?.text ?? null;
-
-      const summaryText = await generatePinSummary(
-        provider,
-        selectedModel,
-        messagesToSummarize,
-        existingSummary,
+      const provider = createProvider(summaryProvider);
+      const existingPin = activeConversation.pinnedSummary;
+      const existingPinIndex = existingPin
+        ? activeConversation.messages.findIndex(
+            (m) => m.id === existingPin.pinnedAtMessageId,
+          )
+        : -1;
+      const canExtendExistingSummary = Boolean(
+        existingPin && existingPinIndex >= 0 && existingPinIndex < msgIndex,
       );
+      const messagesToSummarize = canExtendExistingSummary
+        ? activeConversation.messages.slice(existingPinIndex, msgIndex)
+        : activeConversation.messages.slice(0, msgIndex);
+      const existingSummary = canExtendExistingSummary
+        ? existingPin?.text ?? null
+        : null;
+
+      const summaryText =
+        messagesToSummarize.length > 0
+          ? await generatePinSummary(
+              provider,
+              selectedSummaryModel,
+              messagesToSummarize,
+              existingSummary,
+            )
+          : "";
 
       setConversations((prev) =>
         prev.map((c) =>
@@ -3068,6 +3679,14 @@ export default function App() {
       );
     } catch (err) {
       console.error("Pin summary generation failed:", err);
+      setPinSummaryError({
+        conversationId: activeConversation.id,
+        messageId,
+        message:
+          err instanceof Error
+            ? err.message || "Summary generation failed."
+            : String(err) || "Summary generation failed.",
+      });
     } finally {
       setBusy(false);
     }
@@ -3352,7 +3971,7 @@ export default function App() {
       createdAt: timestampNow(),
       streaming: true,
     };
-    const nextMessages = [...promptMessages, stripTransient(assistantMessage)];
+    const nextMessages = [...promptMessages, assistantMessage];
     const conversationId = activeConversation.id;
 
     setConversations((prev) =>
@@ -3400,7 +4019,7 @@ export default function App() {
         c.id === conversationId
           ? {
               ...c,
-              messages: [...promptMessages, stripTransient(assistantMessage)],
+              messages: [...promptMessages, assistantMessage],
               updatedAt: Date.now(),
             }
           : c,
@@ -3474,7 +4093,7 @@ export default function App() {
           ? {
               ...c,
               title: shouldRetitle ? "Summarizing..." : c.title,
-              messages: [...promptMessages, stripTransient(assistantMessage)],
+              messages: [...promptMessages, assistantMessage],
               updatedAt: Date.now(),
             }
           : c,
@@ -3505,6 +4124,7 @@ export default function App() {
     setConversations((prev) => [conversation, ...prev]);
     setActiveConversationId(conversation.id);
     setSidebarOpen(false);
+    setConversationSearchQuery("");
     setInput("");
     setPendingAttachments([]);
     setAttachmentError(null);
@@ -3546,6 +4166,39 @@ export default function App() {
           ? {
               ...conversation,
               ...patch,
+              updatedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    );
+  }
+
+  function handleSummaryProviderChange(providerId: string) {
+    if (!activeConversation) return;
+    const provider = providers.find((item) => item.id === providerId) ?? null;
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === activeConversation.id
+          ? {
+              ...conversation,
+              summaryProviderId: provider?.id ?? null,
+              summaryModel: provider?.models[0] ?? null,
+              updatedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    );
+  }
+
+  function handleSummaryModelChange(model: string) {
+    if (!activeConversation) return;
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === activeConversation.id
+          ? {
+              ...conversation,
+              summaryProviderId: summaryProvider?.id ?? null,
+              summaryModel: model || null,
               updatedAt: Date.now(),
             }
           : conversation,
@@ -3642,6 +4295,14 @@ export default function App() {
             splitLegacyPromptCacheMode(conversation.claudePromptCache)
               .contextPromptCache,
           ),
+          summaryProviderId:
+            typeof conversation.summaryProviderId === "string"
+              ? conversation.summaryProviderId
+              : null,
+          summaryModel:
+            typeof conversation.summaryModel === "string"
+              ? conversation.summaryModel
+              : null,
           showMessageTimestamps: conversation.showMessageTimestamps ?? false,
           injectCurrentTime: conversation.injectCurrentTime ?? false,
           multiMessageEnabled:
@@ -3780,22 +4441,44 @@ export default function App() {
     setSyncStatus("Syncing...");
     try {
       const localSnapshot = createSyncSnapshot();
+      const localIsEmpty = !hasPersistedMessages(localSnapshot.conversations);
       const cloudSnapshot = await pullSyncSnapshot(syncSettings);
+      if (localIsEmpty) {
+        if (cloudSnapshot && hasPersistedMessages(cloudSnapshot.conversations)) {
+          applySyncSnapshot(cloudSnapshot);
+          const now = Date.now();
+          setSyncSettings((previous) => ({
+            ...previous,
+            lastPulledAt: now,
+          }));
+          setSyncStatus(`Downloaded ${formatSyncSnapshotContents(cloudSnapshot)}.`);
+        } else {
+          setSyncStatus("No cloud history found.");
+        }
+        return;
+      }
+
       const mergedSnapshot = cloudSnapshot
         ? mergeSyncSnapshots(localSnapshot, cloudSnapshot)
         : localSnapshot;
+      const shouldPush =
+        !cloudSnapshot ||
+        syncSnapshotDataSignature(mergedSnapshot) !==
+          syncSnapshotDataSignature(cloudSnapshot);
 
       applySyncSnapshot(mergedSnapshot);
-      const result = await pushSyncSnapshot(syncSettings, mergedSnapshot);
+      const result = shouldPush
+        ? await pushSyncSnapshot(syncSettings, mergedSnapshot)
+        : null;
       const now = Date.now();
       setSyncSettings((previous) => ({
         ...previous,
-        lastPushedAt: now,
+        lastPushedAt: shouldPush ? now : previous.lastPushedAt,
         lastPulledAt: cloudSnapshot ? now : previous.lastPulledAt,
       }));
       setSyncStatus(
         `Synced ${formatSyncSnapshotContents(mergedSnapshot)}${
-          result.bytes ? ` (${formatBytes(result.bytes)})` : ""
+          result?.bytes ? ` (${formatBytes(result.bytes)})` : ""
         }.`,
       );
     } catch (error: unknown) {
@@ -3812,6 +4495,7 @@ export default function App() {
     mergeAndApply: (local, cloud) => mergeSyncSnapshots(local, cloud),
     applySnapshot: applySyncSnapshot,
     isStreaming: () => abortRef.current !== null,
+    localVersion: syncLocalVersion,
     onSyncComplete: (pushed, pulled) => {
       const now = Date.now();
       setSyncSettings((prev) => ({
@@ -3928,44 +4612,149 @@ export default function App() {
               {sidebarCollapsed ? ">" : "<"}
             </button>
           </div>
-        </div>
-        <nav className="cedar-chat-list">
-          {agentConversations.map((conversation) => (
-            <div
-              key={conversation.id}
-              className={`cedar-chat-row ${
-                conversation.id === activeConversation?.id
-                  ? "cedar-chat-row-active"
-                  : ""
-              }`}
-            >
+          <div className="cedar-sidebar-search">
+            <div className="cedar-search-field">
+              <input
+                className="input cedar-search-input"
+                value={conversationSearchQuery}
+                onChange={(event) => setConversationSearchQuery(event.target.value)}
+                placeholder="Search chats"
+                aria-label="Search chats"
+              />
+              {conversationSearchQuery && (
+                <button
+                  type="button"
+                  className="cedar-search-clear"
+                  onClick={() => setConversationSearchQuery("")}
+                  aria-label="Clear search"
+                  title="Clear search"
+                >
+                  x
+                </button>
+              )}
+            </div>
+            <div className="cedar-search-scope" aria-label="Search scope">
               <button
-                onClick={() => {
-                  setActiveConversationId(conversation.id);
-                  setSidebarOpen(false);
-                }}
-                className="cedar-chat-select"
-                title={conversation.title}
+                type="button"
+                className={
+                  conversationSearchScope === "agent" ? "active" : undefined
+                }
+                onClick={() => setConversationSearchScope("agent")}
               >
-                <span className="cedar-chat-initial">
-                  {conversation.title.trim().slice(0, 1).toUpperCase() || "C"}
-                </span>
-                <span className="cedar-chat-copy">
-                  <span className="cedar-chat-title">{conversation.title}</span>
-                  <span className="cedar-chat-count">
-                    {conversation.messages.length} messages
-                  </span>
-                </span>
+                Agent
               </button>
               <button
-                onClick={() => handleDeleteConversation(conversation.id)}
-                className="cedar-delete-button"
-                title="Delete chat"
+                type="button"
+                className={
+                  conversationSearchScope === "all" ? "active" : undefined
+                }
+                onClick={() => setConversationSearchScope("all")}
               >
-                x
+                All
               </button>
             </div>
-          ))}
+          </div>
+        </div>
+        <nav className="cedar-chat-list">
+          {trimmedConversationSearchQuery ? (
+            hasConversationSearchResults ? (
+              <>
+                {titleOnlySearchConversations.map((conversation) => (
+                  <div
+                    key={`title-${conversation.id}`}
+                    className={`cedar-chat-row ${
+                      conversation.id === activeConversation?.id
+                        ? "cedar-chat-row-active"
+                        : ""
+                    }`}
+                  >
+                    <button
+                      onClick={() => selectConversation(conversation.id)}
+                      className="cedar-chat-select"
+                      title={conversation.title}
+                    >
+                      <span className="cedar-chat-initial">
+                        {conversation.title.trim().slice(0, 1).toUpperCase() || "C"}
+                      </span>
+                      <span className="cedar-chat-copy">
+                        <span className="cedar-chat-title">{conversation.title}</span>
+                        <span className="cedar-chat-count">
+                          title match · {conversation.messages.length} messages
+                        </span>
+                      </span>
+                    </button>
+                  </div>
+                ))}
+                {conversationSearchResults.map((result) => (
+                  <div
+                    key={`${result.conversationId}-${result.messageId}`}
+                    className={`cedar-chat-row cedar-search-result-row ${
+                      result.conversationId === activeConversation?.id
+                        ? "cedar-chat-row-active"
+                        : ""
+                    }`}
+                  >
+                    <button
+                      onClick={() =>
+                        selectConversation(result.conversationId, result.messageId)
+                      }
+                      className="cedar-chat-select"
+                      title={result.matchText}
+                    >
+                      <span className="cedar-chat-initial">
+                        {result.messageRole === "user" ? "U" : "A"}
+                      </span>
+                      <span className="cedar-chat-copy">
+                        <span className="cedar-chat-title">
+                          {result.conversationTitle}
+                        </span>
+                        <span className="cedar-chat-count">
+                          {result.messageRole === "user" ? "You" : "Assistant"} ·{" "}
+                          {result.matchText}
+                        </span>
+                      </span>
+                    </button>
+                  </div>
+                ))}
+              </>
+            ) : (
+              <div className="cedar-search-empty">No matches</div>
+            )
+          ) : (
+            agentConversations.map((conversation) => (
+              <div
+                key={conversation.id}
+                className={`cedar-chat-row ${
+                  conversation.id === activeConversation?.id
+                    ? "cedar-chat-row-active"
+                    : ""
+                }`}
+              >
+                <button
+                  onClick={() => selectConversation(conversation.id)}
+                  className="cedar-chat-select"
+                  title={conversation.title}
+                >
+                  <span className="cedar-chat-initial">
+                    {conversation.title.trim().slice(0, 1).toUpperCase() || "C"}
+                  </span>
+                  <span className="cedar-chat-copy">
+                    <span className="cedar-chat-title">{conversation.title}</span>
+                    <span className="cedar-chat-count">
+                      {conversation.messages.length} messages
+                    </span>
+                  </span>
+                </button>
+                <button
+                  onClick={() => handleDeleteConversation(conversation.id)}
+                  className="cedar-delete-button"
+                  title="Delete chat"
+                >
+                  x
+                </button>
+              </div>
+            ))
+          )}
         </nav>
         <div className="cedar-sidebar-footer">
           <div className="cedar-local-line">
@@ -4228,6 +5017,58 @@ export default function App() {
             </div>
           </section>
           <section>
+            <div className="cedar-context-label">Cost</div>
+            <div
+              className="cedar-context-value"
+              title={conversationCostEstimate?.title}
+            >
+              {conversationCostEstimate
+                ? `${conversationCostEstimate.label} · ${conversationCostEstimate.count} rounds`
+                : "No cost yet"}
+            </div>
+          </section>
+          <section>
+            <div className="cedar-context-label">Summary model</div>
+            <div className="cedar-context-model-controls">
+              <label>
+                <span>Provider</span>
+                <select
+                  className="select"
+                  value={activeConversation?.summaryProviderId ?? ""}
+                  onChange={(event) =>
+                    handleSummaryProviderChange(event.target.value)
+                  }
+                  disabled={!activeConversation}
+                >
+                  <option value="">Same as chat</option>
+                  {providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Model</span>
+                <select
+                  className="select"
+                  value={selectedSummaryModel ?? ""}
+                  onChange={(event) =>
+                    handleSummaryModelChange(event.target.value)
+                  }
+                  disabled={!activeConversation || !summaryProvider}
+                >
+                  <option value="">Select model</option>
+                  {summaryProvider?.models.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </section>
+          <section>
             <div className="cedar-context-label">Cache</div>
             <div className="cedar-context-value">
               agent {activeAgentPromptCache} · context {activeContextPromptCache}
@@ -4237,13 +5078,34 @@ export default function App() {
             <div className="cedar-context-label">
               Messages
               {activeConversation?.pinnedSummary && (
-                <span style={{ marginLeft: 8, color: "var(--cedar-accent)", fontSize: "var(--text-xs)" }}>
-                  📌 Pinned
+                <span className="cedar-context-pin-status">
+                  Pinned
                 </span>
               )}
             </div>
+            {activeConversation?.pinnedSummary && (
+              <details className="cedar-context-summary">
+                <summary>Summary</summary>
+                <p>
+                  {activeConversation.pinnedSummary.text.trim() ||
+                    "No earlier messages before this pin."}
+                </p>
+              </details>
+            )}
+            {activePinSummaryError && (
+              <div className="cedar-context-summary-error">
+                <span>Summary failed: {activePinSummaryError.message}</span>
+                <button
+                  type="button"
+                  onClick={() => handlePinMessage(activePinSummaryError.messageId)}
+                  disabled={busy}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
             <div className="cedar-context-messages">
-              {messages.map((m, i) => {
+              {messages.map((m) => {
                 const isPinPoint =
                   activeConversation?.pinnedSummary?.pinnedAtMessageId === m.id;
                 const preview =
@@ -4253,18 +5115,28 @@ export default function App() {
                     key={m.id}
                     className={`cedar-context-msg-item ${isPinPoint ? "cedar-context-msg-pinned" : ""}`}
                   >
-                    
-                    {m.role === "user" && i > 0 && (
-                      <button
-                        type="button"
-                        className="cedar-context-pin-btn"
-                        onClick={() => handlePinMessage(m.id)}
-                        disabled={busy}
-                        title="Pin: summarize everything above"
-                      >
-                        📌
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      role="checkbox"
+                      aria-checked={isPinPoint}
+                      aria-label={
+                        isPinPoint
+                          ? "Unpin message summary"
+                          : "Pin from this message"
+                      }
+                      className={`cedar-context-pin-btn ${
+                        isPinPoint ? "cedar-context-pin-btn-checked" : ""
+                      }`}
+                      onClick={() => handlePinMessage(m.id)}
+                      disabled={busy}
+                      title={
+                        isPinPoint
+                          ? "Unpin message summary"
+                          : "Pin: summarize everything above"
+                      }
+                    >
+                      <span className="cedar-context-pin-mark" aria-hidden="true" />
+                    </button>
                     <span className="cedar-context-msg-role">
                       {m.role === "user" ? "U" : "A"}
                     </span>
@@ -5505,5 +6377,3 @@ function MessageView({
     </article>
   );
 }
-
-

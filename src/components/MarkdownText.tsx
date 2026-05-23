@@ -20,7 +20,7 @@ export function MarkdownText({ text }: { text: string }) {
           // 代码块
           const lines = block.replace(/^\n/, "").split("\n");
           const maybeLang = lines[0]?.trim() ?? "";
-          const hasLang = /^[\w#+.\-]+$/.test(maybeLang);
+          const hasLang = /^[\w#+.-]+$/.test(maybeLang);
           const language = hasLang ? maybeLang : "";
           const code = (hasLang ? lines.slice(1) : lines).join("\n").trimEnd();
 

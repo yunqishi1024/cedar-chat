@@ -56,13 +56,15 @@ export function DocxTranslator({ baseUrl, apiKey, model, onClose }: DocxTranslat
       setStatus("done");
       setProgress(`完成！共翻译 ${result.paragraphCount} 段`);
       downloadBlob(result.blob, result.filename);
-    } catch (err: any) {
-      if (err.name === "AbortError" || err.message === "翻译已取消") {
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      const name = err instanceof Error ? err.name : "";
+      if (name === "AbortError" || message === "翻译已取消") {
         setStatus("idle");
         setProgress("已取消");
       } else {
         setStatus("error");
-        setErrorMsg(err.message || "翻译失败");
+        setErrorMsg(message || "翻译失败");
       }
     }
   };

@@ -5,6 +5,11 @@
 
 import { useState, useEffect, useRef } from "react";
 
+interface MermaidApi {
+  initialize: (config: Record<string, unknown>) => void;
+  render: (id: string, chart: string) => Promise<{ svg: string }>;
+}
+
 // ============================================================
 // 复制按钮
 // ============================================================
@@ -103,10 +108,10 @@ function ReactPreview({ code }: { code: string }) {
   const html = `<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
-<script src="https://unpkg.com/react@19/umd/react.production.min.js"><\/script>
-<script src="https://unpkg.com/react-dom@19/umd/react-dom.production.min.js"><\/script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"><\/script>
-<script src="https://cdn.tailwindcss.com"><\/script>
+<script src="https://unpkg.com/react@19/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@19/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
 <style>*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;}</style>
 </head><body>
 <div id="root"></div>
@@ -121,7 +126,7 @@ const Entry = typeof App !== 'undefined' ? App
   : () => React.createElement('div', null, 'No App/Component found');
 
 ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(Entry));
-<\/script>
+</script>
 </body></html>`;
 
   return (
@@ -186,15 +191,17 @@ function MermaidDiagram({ chart }: { chart: string }) {
     load.then(async () => {
       if (cancelled) return;
       try {
-        const mermaid = (window as any).mermaid;
+        const mermaid = (window as Window & { mermaid?: MermaidApi }).mermaid;
+        if (!mermaid) throw new Error("Mermaid 加载失败");
         mermaid.initialize({ startOnLoad: false, theme: "dark" });
         const id = `mermaid-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const { svg } = await mermaid.render(id, chart);
         if (!cancelled && ref.current) {
           ref.current.innerHTML = svg;
         }
-      } catch (e: any) {
-        if (!cancelled) setError(e.message || "Mermaid 渲染失败");
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : String(e);
+        if (!cancelled) setError(message || "Mermaid 渲染失败");
       }
     });
 
