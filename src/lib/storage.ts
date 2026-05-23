@@ -104,6 +104,8 @@ export interface Conversation {
   agentPromptCache: ClaudePromptCacheTTL;
   contextPromptCache: ClaudePromptCacheTTL;
   claudePromptCache?: ClaudePromptCacheMode;
+  summaryProviderId?: string | null;
+  summaryModel?: string | null;
   showMessageTimestamps: boolean;
   injectCurrentTime: boolean;
   multiMessageEnabled: boolean;

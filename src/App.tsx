@@ -171,6 +171,8 @@ type WindowSettingsPatch = Partial<
     | "thinkingBudgetTokens"
     | "agentPromptCache"
     | "contextPromptCache"
+    | "summaryProviderId"
+    | "summaryModel"
     | "showMessageTimestamps"
     | "injectCurrentTime"
     | "multiMessageEnabled"
@@ -218,6 +220,8 @@ function createEmptyConversation(agentId: string | null): Conversation {
     thinkingBudgetTokens: DEFAULT_THINKING_BUDGET_TOKENS,
     agentPromptCache: DEFAULT_AGENT_PROMPT_CACHE,
     contextPromptCache: DEFAULT_CONTEXT_PROMPT_CACHE,
+    summaryProviderId: null,
+    summaryModel: null,
     showMessageTimestamps: false,
     injectCurrentTime: false,
     multiMessageEnabled: DEFAULT_MULTI_MESSAGE_ENABLED,
@@ -554,10 +558,16 @@ function formatUsd(amount: number): string {
   return `$${amount.toFixed(2)}`;
 }
 
+function formatCostRangeLabel(minCost: number, maxCost: number): string {
+  return Math.abs(maxCost - minCost) < 0.000001
+    ? `≈ ${formatUsd(maxCost)}`
+    : `≈ ${formatUsd(minCost)}-${formatUsd(maxCost)}`;
+}
+
 function estimateMessageCost(
   modelName: string | null,
   usage: NonNullable<UIMessage["usage"]>,
-): { label: string; title: string } | null {
+): { label: string; title: string; minCost: number; maxCost: number } | null {
   const modelMatched = isOpus46Or47Model(modelName);
   const cachedInputTokens = Math.max(0, usage.cachedInputTokens ?? 0);
   const cacheWriteInputTokens = Math.max(0, usage.cacheWriteInputTokens ?? 0);
@@ -591,13 +601,12 @@ function estimateMessageCost(
     standardInputCost + cacheReadCost + cacheWriteCost5m + outputCost;
   const maxCost =
     standardInputCost + cacheReadCost + cacheWriteCost1h + outputCost;
-  const label =
-    Math.abs(maxCost - minCost) < 0.000001
-      ? `≈ ${formatUsd(maxCost)}`
-      : `≈ ${formatUsd(minCost)}-${formatUsd(maxCost)}`;
+  const label = formatCostRangeLabel(minCost, maxCost);
 
   return {
     label,
+    minCost,
+    maxCost,
     title:
       "Claude Opus 4.6/4.7 standard API estimate" +
       (modelMatched ? "" : " (model name was not recognized, using Opus pricing)") +
@@ -606,6 +615,37 @@ function estimateMessageCost(
       `cache hit ${cachedInputTokens} @ $0.50/M, ` +
       `cache write ${cacheWriteInputTokens} @ $6.25-$10/M, ` +
       `output ${outputTokens} @ $25/M.`,
+  };
+}
+
+function estimateConversationCost(
+  messages: UIMessage[],
+  fallbackModelName: string | null,
+): { label: string; title: string; count: number } | null {
+  let minCost = 0;
+  let maxCost = 0;
+  let count = 0;
+
+  for (const message of messages) {
+    if (!message.usage || message.streaming) continue;
+    const estimate = estimateMessageCost(
+      message.model ?? fallbackModelName,
+      message.usage,
+    );
+    if (!estimate) continue;
+    minCost += estimate.minCost;
+    maxCost += estimate.maxCost;
+    count += 1;
+  }
+
+  if (count === 0) return null;
+
+  return {
+    label: formatCostRangeLabel(minCost, maxCost),
+    title:
+      `Total estimate for ${count} completed response${count === 1 ? "" : "s"}. ` +
+      "Uses the same Claude Opus 4.6/4.7 pricing estimate shown below each message.",
+    count,
   };
 }
 
@@ -1531,6 +1571,12 @@ function isConversation(value: unknown): value is Conversation {
       typeof value.contextPromptCache === "string") &&
     (value.claudePromptCache === undefined ||
       typeof value.claudePromptCache === "string") &&
+    (value.summaryProviderId === undefined ||
+      value.summaryProviderId === null ||
+      typeof value.summaryProviderId === "string") &&
+    (value.summaryModel === undefined ||
+      value.summaryModel === null ||
+      typeof value.summaryModel === "string") &&
     (value.showMessageTimestamps === undefined ||
       typeof value.showMessageTimestamps === "boolean") &&
     (value.injectCurrentTime === undefined ||
@@ -1895,6 +1941,14 @@ function normalizeConversationsForAgents(
         conversation.claudePromptCache ?? fallbackCacheMode,
       ).contextPromptCache,
     ),
+    summaryProviderId:
+      typeof conversation.summaryProviderId === "string"
+        ? conversation.summaryProviderId
+        : null,
+    summaryModel:
+      typeof conversation.summaryModel === "string"
+        ? conversation.summaryModel
+        : null,
     showMessageTimestamps: conversation.showMessageTimestamps ?? false,
     injectCurrentTime: conversation.injectCurrentTime ?? false,
     multiMessageEnabled:
@@ -2163,6 +2217,11 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
+  const [pinSummaryError, setPinSummaryError] = useState<{
+    conversationId: string;
+    messageId: string;
+    message: string;
+  } | null>(null);
   const [beijingTime, setBeijingTime] = useState(() => formatBeijingClock());
   const [weatherLabel, setWeatherLabel] = useState(WEATHER_FALLBACK_LABEL);
   const [agentsOpen, setAgentsOpen] = useState(false);
@@ -2217,6 +2276,24 @@ export default function App() {
     [activeModel, currentProvider],
   );
 
+  const summaryProviderId =
+    activeConversation?.summaryProviderId ?? activeProviderId;
+  const summaryProvider = useMemo(
+    () => providers.find((p) => p.id === summaryProviderId) ?? null,
+    [providers, summaryProviderId],
+  );
+  const activeSummaryModel = activeConversation?.summaryModel ?? null;
+  const selectedSummaryModel =
+    summaryProvider &&
+    activeSummaryModel &&
+    summaryProvider.models.includes(activeSummaryModel)
+      ? activeSummaryModel
+      : (summaryProvider?.models[0] ?? null);
+  const activePinSummaryError =
+    pinSummaryError?.conversationId === activeConversation?.id
+      ? pinSummaryError
+      : null;
+
   const capability = useMemo(
     () => (selectedModel ? getCapability(selectedModel) : null),
     [selectedModel],
@@ -2241,6 +2318,10 @@ export default function App() {
   const lastUsage = useMemo(
     () => messages.findLast((message) => message.usage)?.usage,
     [messages],
+  );
+  const conversationCostEstimate = useMemo(
+    () => estimateConversationCost(messages, selectedModel),
+    [messages, selectedModel],
   );
   const enabledMcpServers = useMemo(
     () => mcpServers.filter((server) => server.enabled),
@@ -2600,33 +2681,38 @@ export default function App() {
         claudeCacheAvailable && contextPromptCache !== "off";
       const currentTimeAfterCache =
         contextCacheEnabled && injectCurrentTime;
-      
-      // Pin/Summary: 如果有 pinnedSummary，发 [summary pair (cached)] + [post-pin messages]
-      const pinnedSummary = activeConversation?.pinnedSummary;
+
+      // Pin/Summary: 如果有 pinnedSummary，发 [summary pair] + [post-pin messages].
+      // Context cache 只决定是否加 cache_control；pin 截断本身不依赖缓存开关。
+      const pinnedSummary =
+        activeConversation?.id === conversationId
+          ? activeConversation.pinnedSummary
+          : null;
       let requestMessages: ChatMessage[];
 
-      if (pinnedSummary && contextCacheEnabled) {
-        const pinIdx = trimmed.findIndex(
+      if (pinnedSummary) {
+        const pinIdx = promptMessages.findIndex(
           (m) => m.id === pinnedSummary.pinnedAtMessageId,
         );
+        const postPinSource = pinIdx >= 0 ? promptMessages.slice(pinIdx) : trimmed;
         const postPinMessages: ChatMessage[] =
-          pinIdx >= 0
-            ? trimmed.slice(pinIdx).map((m) => ({
-                role: m.role,
-                content: requestContentFromBlocks(m.content),
-              }))
-            : trimmed.map((m) => ({
-                role: m.role,
-                content: requestContentFromBlocks(m.content),
-              }));
+          postPinSource.map((m) => ({
+            role: m.role,
+            content: requestContentFromBlocks(m.content),
+          }));
 
-        const cacheCtrl = cacheControlForTTL(contextPromptCache);
+        const summaryText =
+          pinnedSummary.text.trim() ||
+          "There were no earlier messages before the pinned point.";
+        const cacheCtrl = contextCacheEnabled
+          ? cacheControlForTTL(contextPromptCache)
+          : undefined;
         const summaryUserMessage: ChatMessage = {
           role: "user",
           content: [
             {
               type: "text",
-              text: `<conversation-summary>\n${pinnedSummary.text}\n</conversation-summary>\n\nThe above is a summary of our earlier conversation. Continue from here.`,
+              text: `<conversation-summary>\n${summaryText}\n</conversation-summary>\n\nThe above is a summary of our earlier conversation. Continue from here.`,
               ...(cacheCtrl ? { cache_control: cacheCtrl } : {}),
             },
           ],
@@ -3274,25 +3360,63 @@ export default function App() {
 
   
   async function handlePinMessage(messageId: string) {
-    if (!currentProvider || !selectedModel || busy || !activeConversation) return;
+    if (busy || !activeConversation) return;
+
+    if (activeConversation.pinnedSummary?.pinnedAtMessageId === messageId) {
+      setPinSummaryError(null);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === activeConversation.id
+            ? { ...c, pinnedSummary: null, updatedAt: Date.now() }
+            : c,
+        ),
+      );
+      return;
+    }
+
+    if (!summaryProvider || !selectedSummaryModel) {
+      setPinSummaryError({
+        conversationId: activeConversation.id,
+        messageId,
+        message: "Choose a summary model before pinning.",
+      });
+      return;
+    }
 
     const msgIndex = activeConversation.messages.findIndex(
       (m) => m.id === messageId,
     );
-    if (msgIndex <= 0) return;
+    if (msgIndex < 0) return;
 
     setBusy(true);
+    setPinSummaryError(null);
     try {
-      const provider = createProvider(currentProvider);
-      const messagesToSummarize = activeConversation.messages.slice(0, msgIndex);
-      const existingSummary = activeConversation.pinnedSummary?.text ?? null;
-
-      const summaryText = await generatePinSummary(
-        provider,
-        selectedModel,
-        messagesToSummarize,
-        existingSummary,
+      const provider = createProvider(summaryProvider);
+      const existingPin = activeConversation.pinnedSummary;
+      const existingPinIndex = existingPin
+        ? activeConversation.messages.findIndex(
+            (m) => m.id === existingPin.pinnedAtMessageId,
+          )
+        : -1;
+      const canExtendExistingSummary = Boolean(
+        existingPin && existingPinIndex >= 0 && existingPinIndex < msgIndex,
       );
+      const messagesToSummarize = canExtendExistingSummary
+        ? activeConversation.messages.slice(existingPinIndex, msgIndex)
+        : activeConversation.messages.slice(0, msgIndex);
+      const existingSummary = canExtendExistingSummary
+        ? existingPin?.text ?? null
+        : null;
+
+      const summaryText =
+        messagesToSummarize.length > 0
+          ? await generatePinSummary(
+              provider,
+              selectedSummaryModel,
+              messagesToSummarize,
+              existingSummary,
+            )
+          : "";
 
       setConversations((prev) =>
         prev.map((c) =>
@@ -3311,6 +3435,14 @@ export default function App() {
       );
     } catch (err) {
       console.error("Pin summary generation failed:", err);
+      setPinSummaryError({
+        conversationId: activeConversation.id,
+        messageId,
+        message:
+          err instanceof Error
+            ? err.message || "Summary generation failed."
+            : String(err) || "Summary generation failed.",
+      });
     } finally {
       setBusy(false);
     }
@@ -3796,6 +3928,39 @@ export default function App() {
     );
   }
 
+  function handleSummaryProviderChange(providerId: string) {
+    if (!activeConversation) return;
+    const provider = providers.find((item) => item.id === providerId) ?? null;
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === activeConversation.id
+          ? {
+              ...conversation,
+              summaryProviderId: provider?.id ?? null,
+              summaryModel: provider?.models[0] ?? null,
+              updatedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    );
+  }
+
+  function handleSummaryModelChange(model: string) {
+    if (!activeConversation) return;
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === activeConversation.id
+          ? {
+              ...conversation,
+              summaryProviderId: summaryProvider?.id ?? null,
+              summaryModel: model || null,
+              updatedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    );
+  }
+
   function toggleExportConversation(id: string) {
     setExportSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
@@ -3885,6 +4050,14 @@ export default function App() {
             splitLegacyPromptCacheMode(conversation.claudePromptCache)
               .contextPromptCache,
           ),
+          summaryProviderId:
+            typeof conversation.summaryProviderId === "string"
+              ? conversation.summaryProviderId
+              : null,
+          summaryModel:
+            typeof conversation.summaryModel === "string"
+              ? conversation.summaryModel
+              : null,
           showMessageTimestamps: conversation.showMessageTimestamps ?? false,
           injectCurrentTime: conversation.injectCurrentTime ?? false,
           multiMessageEnabled:
@@ -4494,6 +4667,58 @@ export default function App() {
             </div>
           </section>
           <section>
+            <div className="cedar-context-label">Cost</div>
+            <div
+              className="cedar-context-value"
+              title={conversationCostEstimate?.title}
+            >
+              {conversationCostEstimate
+                ? `${conversationCostEstimate.label} · ${conversationCostEstimate.count} rounds`
+                : "No cost yet"}
+            </div>
+          </section>
+          <section>
+            <div className="cedar-context-label">Summary model</div>
+            <div className="cedar-context-model-controls">
+              <label>
+                <span>Provider</span>
+                <select
+                  className="select"
+                  value={activeConversation?.summaryProviderId ?? ""}
+                  onChange={(event) =>
+                    handleSummaryProviderChange(event.target.value)
+                  }
+                  disabled={!activeConversation}
+                >
+                  <option value="">Same as chat</option>
+                  {providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Model</span>
+                <select
+                  className="select"
+                  value={selectedSummaryModel ?? ""}
+                  onChange={(event) =>
+                    handleSummaryModelChange(event.target.value)
+                  }
+                  disabled={!activeConversation || !summaryProvider}
+                >
+                  <option value="">Select model</option>
+                  {summaryProvider?.models.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </section>
+          <section>
             <div className="cedar-context-label">Cache</div>
             <div className="cedar-context-value">
               agent {activeAgentPromptCache} · context {activeContextPromptCache}
@@ -4503,13 +4728,34 @@ export default function App() {
             <div className="cedar-context-label">
               Messages
               {activeConversation?.pinnedSummary && (
-                <span style={{ marginLeft: 8, color: "var(--cedar-accent)", fontSize: "var(--text-xs)" }}>
-                  📌 Pinned
+                <span className="cedar-context-pin-status">
+                  Pinned
                 </span>
               )}
             </div>
+            {activeConversation?.pinnedSummary && (
+              <details className="cedar-context-summary">
+                <summary>Summary</summary>
+                <p>
+                  {activeConversation.pinnedSummary.text.trim() ||
+                    "No earlier messages before this pin."}
+                </p>
+              </details>
+            )}
+            {activePinSummaryError && (
+              <div className="cedar-context-summary-error">
+                <span>Summary failed: {activePinSummaryError.message}</span>
+                <button
+                  type="button"
+                  onClick={() => handlePinMessage(activePinSummaryError.messageId)}
+                  disabled={busy}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
             <div className="cedar-context-messages">
-              {messages.map((m, i) => {
+              {messages.map((m) => {
                 const isPinPoint =
                   activeConversation?.pinnedSummary?.pinnedAtMessageId === m.id;
                 const preview =
@@ -4519,18 +4765,28 @@ export default function App() {
                     key={m.id}
                     className={`cedar-context-msg-item ${isPinPoint ? "cedar-context-msg-pinned" : ""}`}
                   >
-                    
-                    {m.role === "user" && i > 0 && (
-                      <button
-                        type="button"
-                        className="cedar-context-pin-btn"
-                        onClick={() => handlePinMessage(m.id)}
-                        disabled={busy}
-                        title="Pin: summarize everything above"
-                      >
-                        📌
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      role="checkbox"
+                      aria-checked={isPinPoint}
+                      aria-label={
+                        isPinPoint
+                          ? "Unpin message summary"
+                          : "Pin from this message"
+                      }
+                      className={`cedar-context-pin-btn ${
+                        isPinPoint ? "cedar-context-pin-btn-checked" : ""
+                      }`}
+                      onClick={() => handlePinMessage(m.id)}
+                      disabled={busy}
+                      title={
+                        isPinPoint
+                          ? "Unpin message summary"
+                          : "Pin: summarize everything above"
+                      }
+                    >
+                      <span className="cedar-context-pin-mark" aria-hidden="true" />
+                    </button>
                     <span className="cedar-context-msg-role">
                       {m.role === "user" ? "U" : "A"}
                     </span>
