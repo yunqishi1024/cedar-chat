@@ -197,6 +197,69 @@ input:disabled {
   flex: 1;
 }
 
+.cedar-sidebar-search {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.cedar-search-field {
+  position: relative;
+}
+
+.cedar-search-input {
+  min-height: 2.1rem;
+  padding-right: 2rem;
+  font-size: var(--text-xs);
+}
+
+.cedar-search-clear {
+  position: absolute;
+  top: 50%;
+  right: 0.35rem;
+  display: inline-flex;
+  width: 1.45rem;
+  height: 1.45rem;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  transform: translateY(-50%);
+}
+
+.cedar-search-clear:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.cedar-search-scope {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.cedar-search-scope button {
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-tertiary);
+  padding: 0.35rem var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.cedar-search-scope button + button {
+  border-left: 1px solid var(--border-default);
+}
+
+.cedar-search-scope button:hover,
+.cedar-search-scope button.active {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
 .cedar-chat-list {
   display: grid;
   flex: 1;
@@ -267,6 +330,23 @@ input:disabled {
 .cedar-chat-count {
   color: var(--text-tertiary);
   font-size: var(--text-xs);
+}
+
+.cedar-search-result-row .cedar-chat-select {
+  align-items: flex-start;
+}
+
+.cedar-search-result-row .cedar-chat-count {
+  display: -webkit-box;
+  white-space: normal;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.cedar-search-empty {
+  padding: var(--space-3);
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
 }
 
 .cedar-delete-button,
@@ -1156,6 +1236,7 @@ input:disabled {
 
   .cedar-sidebar-collapsed .cedar-sidebar-label,
   .cedar-sidebar-collapsed .cedar-agent-select,
+  .cedar-sidebar-collapsed .cedar-sidebar-search,
   .cedar-sidebar-collapsed .cedar-chat-copy,
   .cedar-sidebar-collapsed .cedar-delete-button,
   .cedar-sidebar-collapsed .cedar-collapse-button {

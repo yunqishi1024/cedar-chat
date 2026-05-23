@@ -86,6 +86,11 @@ import {
   type McpToolSummary,
 } from "./lib/mcp";
 import {
+  searchConversationTitles,
+  searchConversations,
+  type SearchResult,
+} from "./lib/search";
+import {
   loadLocalBackup,
   saveLocalBackupSoon,
   type CedarLocalBackup,
@@ -134,6 +139,9 @@ interface ActiveMcpTool {
   chatTool: ChatTool;
 }
 
+type ChatHistorySearchScope = "current" | "all";
+type SidebarSearchScope = "agent" | "all";
+
 const DEFAULT_TEMPERATURE = 0.7;
 const DEFAULT_REASONING_ENABLED = true;
 const DEFAULT_THINKING_MODE: ThinkingMode = "effort";
@@ -148,6 +156,9 @@ const DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS = 160;
 const MAX_MCP_TOOL_ROUNDS = 6;
 const MAX_MCP_RESULT_CHARS = 120_000;
 const MAX_TOOL_BLOCK_CHARS = 4_000;
+const CHAT_HISTORY_SEARCH_TOOL_NAME = "search_chat_history";
+const DEFAULT_CHAT_HISTORY_SEARCH_LIMIT = 10;
+const MAX_CHAT_HISTORY_SEARCH_LIMIT = 30;
 const WEATHER_LOCATION = "Beijing";
 const WEATHER_FALLBACK_LABEL = "多云";
 const TOKENS_PER_MILLION = 1_000_000;
@@ -467,6 +478,135 @@ async function prepareMcpTools(
       };
     }),
   );
+}
+
+const CHAT_HISTORY_SEARCH_TOOL: ChatTool = {
+  type: "function",
+  function: {
+    name: CHAT_HISTORY_SEARCH_TOOL_NAME,
+    description:
+      "Search saved Cedar Chat conversation history. Use scope='current' to search this chat window, or scope='all' to search across all chat windows.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Text to find in conversation titles, messages, attachments, or tool output.",
+        },
+        scope: {
+          type: "string",
+          enum: ["current", "all"],
+          description: "Search only the current chat window or all saved chat windows.",
+        },
+        maxResults: {
+          type: "number",
+          description: `Maximum results to return, up to ${MAX_CHAT_HISTORY_SEARCH_LIMIT}.`,
+        },
+      },
+      required: ["query"],
+    },
+  },
+};
+
+function normalizeChatHistorySearchScope(value: unknown): ChatHistorySearchScope {
+  return value === "current" ? "current" : "all";
+}
+
+function normalizeChatHistorySearchLimit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_CHAT_HISTORY_SEARCH_LIMIT;
+  }
+  return Math.max(
+    1,
+    Math.min(MAX_CHAT_HISTORY_SEARCH_LIMIT, Math.round(value)),
+  );
+}
+
+function chatHistorySearchCorpus(
+  conversations: Conversation[],
+  currentConversationId: string,
+  currentPromptMessages: StoredMessage[],
+): Conversation[] {
+  let replacedCurrent = false;
+  const next = conversations.map((conversation) => {
+    if (conversation.id !== currentConversationId) return conversation;
+    replacedCurrent = true;
+    return {
+      ...conversation,
+      messages: currentPromptMessages,
+    };
+  });
+  return replacedCurrent ? next : conversations;
+}
+
+function formatSearchResultTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+function formatChatHistorySearchToolResult(
+  query: string,
+  scope: ChatHistorySearchScope,
+  results: SearchResult[],
+  titleMatches: Conversation[],
+): string {
+  return JSON.stringify(
+    {
+      query,
+      scope,
+      count: results.length + titleMatches.length,
+      messageResultCount: results.length,
+      titleMatchCount: titleMatches.length,
+      titleMatches: titleMatches.map((conversation) => ({
+        conversationId: conversation.id,
+        conversationTitle: conversation.title,
+        messageCount: conversation.messages.length,
+        updatedAt: formatSearchResultTime(conversation.updatedAt),
+      })),
+      results: results.map((result) => ({
+        conversationId: result.conversationId,
+        conversationTitle: result.conversationTitle,
+        messageId: result.messageId,
+        messageNumber: result.messageIndex + 1,
+        role: result.messageRole,
+        createdAt: formatSearchResultTime(result.createdAt),
+        snippet: result.matchText,
+      })),
+    },
+    null,
+    2,
+  );
+}
+
+function runChatHistorySearchTool(
+  args: Record<string, unknown>,
+  conversations: Conversation[],
+  currentConversationId: string,
+): string {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  if (!query) {
+    return JSON.stringify(
+      {
+        error: "query is required",
+        results: [],
+      },
+      null,
+      2,
+    );
+  }
+
+  const scope = normalizeChatHistorySearchScope(args.scope);
+  const maxResults = normalizeChatHistorySearchLimit(args.maxResults);
+  const corpus =
+    scope === "current"
+      ? conversations.filter((conversation) => conversation.id === currentConversationId)
+      : conversations;
+  const results = searchConversations(corpus, query, maxResults);
+  const messageMatchIds = new Set(results.map((result) => result.conversationId));
+  const titleMatches = searchConversationTitles(corpus, query)
+    .filter((conversation) => !messageMatchIds.has(conversation.id))
+    .slice(0, maxResults);
+  return formatChatHistorySearchToolResult(query, scope, results, titleMatches);
 }
 
 function parseToolArguments(raw: string): Record<string, unknown> {
@@ -2159,6 +2299,20 @@ export default function App() {
     cancelEditing();
   }
 
+  function selectConversation(conversationId: string, messageId?: string) {
+    const target = conversations.find(
+      (conversation) => conversation.id === conversationId,
+    );
+    setChatState((previous) => ({
+      ...previous,
+      activeAgentId: target?.agentId ?? previous.activeAgentId,
+      activeConversationId: conversationId,
+    }));
+    if (messageId) setPendingSearchMessageId(messageId);
+    setSidebarOpen(false);
+    cancelEditing();
+  }
+
   function openSettings(tab: SettingsTab = "providers") {
     setSettingsTab(tab);
     setSettingsOpen(true);
@@ -2216,6 +2370,12 @@ export default function App() {
   const [exportSelectedIds, setExportSelectedIds] = useState<string[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [conversationSearchQuery, setConversationSearchQuery] = useState("");
+  const [conversationSearchScope, setConversationSearchScope] =
+    useState<SidebarSearchScope>("agent");
+  const [pendingSearchMessageId, setPendingSearchMessageId] = useState<
+    string | null
+  >(null);
   const [contextOpen, setContextOpen] = useState(false);
   const [pinSummaryError, setPinSummaryError] = useState<{
     conversationId: string;
@@ -2262,6 +2422,36 @@ export default function App() {
   const voiceMessageBudgetTokens =
     activeConversation?.voiceMessageBudgetTokens ??
     DEFAULT_VOICE_MESSAGE_BUDGET_TOKENS;
+  const trimmedConversationSearchQuery = conversationSearchQuery.trim();
+  const sidebarSearchConversations =
+    conversationSearchScope === "all" ? conversations : agentConversations;
+  const conversationSearchResults = useMemo(
+    () =>
+      trimmedConversationSearchQuery
+        ? searchConversations(
+            sidebarSearchConversations,
+            trimmedConversationSearchQuery,
+            80,
+          )
+        : [],
+    [sidebarSearchConversations, trimmedConversationSearchQuery],
+  );
+  const titleOnlySearchConversations = useMemo(() => {
+    if (!trimmedConversationSearchQuery) return [];
+    const messageMatchIds = new Set(
+      conversationSearchResults.map((result) => result.conversationId),
+    );
+    return searchConversationTitles(
+      sidebarSearchConversations,
+      trimmedConversationSearchQuery,
+    ).filter((conversation) => !messageMatchIds.has(conversation.id));
+  }, [
+    conversationSearchResults,
+    sidebarSearchConversations,
+    trimmedConversationSearchQuery,
+  ]);
+  const hasConversationSearchResults =
+    conversationSearchResults.length > 0 || titleOnlySearchConversations.length > 0;
 
   const currentProvider = useMemo(
     () => providers.find((p) => p.id === activeProviderId) ?? null,
@@ -2531,6 +2721,17 @@ export default function App() {
     saveActiveConversationId(activeConversation?.id ?? null);
   }, [activeConversation?.id]);
 
+  useEffect(() => {
+    if (!pendingSearchMessageId) return;
+    const timer = window.setTimeout(() => {
+      const element = document.getElementById(`msg-${pendingSearchMessageId}`);
+      if (!element) return;
+      element.scrollIntoView({ behavior: "smooth", block: "center" });
+      setPendingSearchMessageId(null);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [activeConversation?.id, messages.length, pendingSearchMessageId]);
+
   async function persistVoiceAudio(
     blob: Blob,
     voiceBlockId: string,
@@ -2666,10 +2867,18 @@ export default function App() {
       const provider = createProvider(currentProvider);
       const cap = getCapability(selectedModel);
       const activeMcpTools = await prepareMcpTools(mcpServers);
+      const toolSearchCorpus = chatHistorySearchCorpus(
+        conversations,
+        conversationId,
+        promptMessages,
+      );
       const mcpToolByName = new Map(
         activeMcpTools.map((tool) => [tool.functionName, tool]),
       );
-      const chatTools = activeMcpTools.map((tool) => tool.chatTool);
+      const chatTools = [
+        CHAT_HISTORY_SEARCH_TOOL,
+        ...activeMcpTools.map((tool) => tool.chatTool),
+      ];
 
       // 构造请求 - 只传当前模型实际支持的字段，剩下的 provider 内部会再过一遍
       // historyDepth: 取最后 N 条上下文；普通发送时 promptMessages 已经包含新用户消息
@@ -2888,7 +3097,11 @@ export default function App() {
 
         for (const toolCall of toolCalls) {
           const activeTool = mcpToolByName.get(toolCall.function.name);
-          const toolBlockName = activeTool?.displayName ?? toolCall.function.name;
+          const isHistorySearchTool =
+            toolCall.function.name === CHAT_HISTORY_SEARCH_TOOL_NAME;
+          const toolBlockName = isHistorySearchTool
+            ? "Chat history search"
+            : (activeTool?.displayName ?? toolCall.function.name);
           const toolBlockInput = formatToolInput(toolCall.function.arguments);
           toolBlocks = [
             ...toolBlocks,
@@ -2911,7 +3124,38 @@ export default function App() {
           );
           let toolResultText: string;
 
-          if (!activeTool) {
+          if (isHistorySearchTool) {
+            try {
+              const args = parseToolArguments(toolCall.function.arguments);
+              toolResultText = runChatHistorySearchTool(
+                args,
+                toolSearchCorpus,
+                conversationId,
+              );
+              toolBlocks = toolBlocks.map((block) =>
+                block.id === toolCall.id
+                  ? {
+                      ...block,
+                      status: "success",
+                      output: limitToolBlockText(toolResultText),
+                    }
+                  : block,
+              );
+            } catch (error: unknown) {
+              const detail =
+                error instanceof Error ? error.message : String(error);
+              toolResultText = `Chat history search failed: ${detail}`;
+              toolBlocks = toolBlocks.map((block) =>
+                block.id === toolCall.id
+                  ? {
+                      ...block,
+                      status: "error",
+                      error: detail,
+                    }
+                  : block,
+              );
+            }
+          } else if (!activeTool) {
             toolResultText = `MCP tool ${toolCall.function.name} is not available.`;
             toolBlocks = toolBlocks.map((block) =>
               block.id === toolCall.id
@@ -3880,6 +4124,7 @@ export default function App() {
     setConversations((prev) => [conversation, ...prev]);
     setActiveConversationId(conversation.id);
     setSidebarOpen(false);
+    setConversationSearchQuery("");
     setInput("");
     setPendingAttachments([]);
     setAttachmentError(null);
@@ -4367,44 +4612,149 @@ export default function App() {
               {sidebarCollapsed ? ">" : "<"}
             </button>
           </div>
-        </div>
-        <nav className="cedar-chat-list">
-          {agentConversations.map((conversation) => (
-            <div
-              key={conversation.id}
-              className={`cedar-chat-row ${
-                conversation.id === activeConversation?.id
-                  ? "cedar-chat-row-active"
-                  : ""
-              }`}
-            >
+          <div className="cedar-sidebar-search">
+            <div className="cedar-search-field">
+              <input
+                className="input cedar-search-input"
+                value={conversationSearchQuery}
+                onChange={(event) => setConversationSearchQuery(event.target.value)}
+                placeholder="Search chats"
+                aria-label="Search chats"
+              />
+              {conversationSearchQuery && (
+                <button
+                  type="button"
+                  className="cedar-search-clear"
+                  onClick={() => setConversationSearchQuery("")}
+                  aria-label="Clear search"
+                  title="Clear search"
+                >
+                  x
+                </button>
+              )}
+            </div>
+            <div className="cedar-search-scope" aria-label="Search scope">
               <button
-                onClick={() => {
-                  setActiveConversationId(conversation.id);
-                  setSidebarOpen(false);
-                }}
-                className="cedar-chat-select"
-                title={conversation.title}
+                type="button"
+                className={
+                  conversationSearchScope === "agent" ? "active" : undefined
+                }
+                onClick={() => setConversationSearchScope("agent")}
               >
-                <span className="cedar-chat-initial">
-                  {conversation.title.trim().slice(0, 1).toUpperCase() || "C"}
-                </span>
-                <span className="cedar-chat-copy">
-                  <span className="cedar-chat-title">{conversation.title}</span>
-                  <span className="cedar-chat-count">
-                    {conversation.messages.length} messages
-                  </span>
-                </span>
+                Agent
               </button>
               <button
-                onClick={() => handleDeleteConversation(conversation.id)}
-                className="cedar-delete-button"
-                title="Delete chat"
+                type="button"
+                className={
+                  conversationSearchScope === "all" ? "active" : undefined
+                }
+                onClick={() => setConversationSearchScope("all")}
               >
-                x
+                All
               </button>
             </div>
-          ))}
+          </div>
+        </div>
+        <nav className="cedar-chat-list">
+          {trimmedConversationSearchQuery ? (
+            hasConversationSearchResults ? (
+              <>
+                {titleOnlySearchConversations.map((conversation) => (
+                  <div
+                    key={`title-${conversation.id}`}
+                    className={`cedar-chat-row ${
+                      conversation.id === activeConversation?.id
+                        ? "cedar-chat-row-active"
+                        : ""
+                    }`}
+                  >
+                    <button
+                      onClick={() => selectConversation(conversation.id)}
+                      className="cedar-chat-select"
+                      title={conversation.title}
+                    >
+                      <span className="cedar-chat-initial">
+                        {conversation.title.trim().slice(0, 1).toUpperCase() || "C"}
+                      </span>
+                      <span className="cedar-chat-copy">
+                        <span className="cedar-chat-title">{conversation.title}</span>
+                        <span className="cedar-chat-count">
+                          title match · {conversation.messages.length} messages
+                        </span>
+                      </span>
+                    </button>
+                  </div>
+                ))}
+                {conversationSearchResults.map((result) => (
+                  <div
+                    key={`${result.conversationId}-${result.messageId}`}
+                    className={`cedar-chat-row cedar-search-result-row ${
+                      result.conversationId === activeConversation?.id
+                        ? "cedar-chat-row-active"
+                        : ""
+                    }`}
+                  >
+                    <button
+                      onClick={() =>
+                        selectConversation(result.conversationId, result.messageId)
+                      }
+                      className="cedar-chat-select"
+                      title={result.matchText}
+                    >
+                      <span className="cedar-chat-initial">
+                        {result.messageRole === "user" ? "U" : "A"}
+                      </span>
+                      <span className="cedar-chat-copy">
+                        <span className="cedar-chat-title">
+                          {result.conversationTitle}
+                        </span>
+                        <span className="cedar-chat-count">
+                          {result.messageRole === "user" ? "You" : "Assistant"} ·{" "}
+                          {result.matchText}
+                        </span>
+                      </span>
+                    </button>
+                  </div>
+                ))}
+              </>
+            ) : (
+              <div className="cedar-search-empty">No matches</div>
+            )
+          ) : (
+            agentConversations.map((conversation) => (
+              <div
+                key={conversation.id}
+                className={`cedar-chat-row ${
+                  conversation.id === activeConversation?.id
+                    ? "cedar-chat-row-active"
+                    : ""
+                }`}
+              >
+                <button
+                  onClick={() => selectConversation(conversation.id)}
+                  className="cedar-chat-select"
+                  title={conversation.title}
+                >
+                  <span className="cedar-chat-initial">
+                    {conversation.title.trim().slice(0, 1).toUpperCase() || "C"}
+                  </span>
+                  <span className="cedar-chat-copy">
+                    <span className="cedar-chat-title">{conversation.title}</span>
+                    <span className="cedar-chat-count">
+                      {conversation.messages.length} messages
+                    </span>
+                  </span>
+                </button>
+                <button
+                  onClick={() => handleDeleteConversation(conversation.id)}
+                  className="cedar-delete-button"
+                  title="Delete chat"
+                >
+                  x
+                </button>
+              </div>
+            ))
+          )}
         </nav>
         <div className="cedar-sidebar-footer">
           <div className="cedar-local-line">
