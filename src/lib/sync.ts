@@ -608,6 +608,24 @@ async function pushEncryptedSyncObject(
   return new TextEncoder().encode(body).byteLength;
 }
 
+async function pushIncrementalManifest(
+  settings: SyncSettings,
+  manifest: CedarSyncV2Manifest,
+): Promise<number> {
+  const envelope = await encryptSyncObject(manifest, settings.syncCode.trim());
+  const body = JSON.stringify(envelope);
+  const response = await fetch(syncV2Url(settings.endpoint, "/manifest"), {
+    method: "PUT",
+    headers: {
+      ...authHeaders(settings),
+      "Content-Type": "application/json",
+    },
+    body,
+  });
+  if (!response.ok) throw await responseError(response);
+  return new TextEncoder().encode(body).byteLength;
+}
+
 function syncObject<T>(key: string, value: T): { key: string; value: T } {
   return { key, value };
 }
@@ -734,7 +752,7 @@ async function pushIncrementalSyncSnapshot(
     if (sameRef(previousRefs.get(object.key), object.ref)) continue;
     bytes += await pushEncryptedSyncObject(settings, object.key, object.value);
   }
-  bytes += await pushEncryptedSyncObject(settings, "manifest.json", manifest);
+  bytes += await pushIncrementalManifest(settings, manifest);
 
   return {
     updatedAt: manifest.updatedAt,
